@@ -56,27 +56,16 @@ def test_orchestrator_quarantined_request(mock_call_groq):
     assert "stock trading" in res["reason"]
 
 @patch("finflow_agent.orchestrator.call_groq_json")
-def test_orchestrator_retry_then_success(mock_call_groq):
+def test_orchestrator_quarantines_initial_llm_error_without_blind_retry(mock_call_groq):
     orchestrator = Orchestrator()
     
-    mock_call_groq.side_effect = [
-        ValueError("Invalid JSON returned from LLM"),
-        {
-            "is_quarantined": False,
-            "needs_cleaning": False,
-            "needs_filtering": False,
-            "needs_calculation": False,
-            "needs_visualization": False,
-            "output_format": "xlsx"
-        }
-    ]
+    mock_call_groq.side_effect = ValueError("Invalid JSON returned from LLM")
     
     res = orchestrator.build_plan("run pipeline", "test.csv", "test.csv", "xlsx")
-    assert isinstance(res, ExecutionPlan)
-    assert len(res.steps) == 2  # ingestion and reporting
-    assert res.steps[0].agent == "ingestion_agent"
-    assert res.steps[1].agent == "reporting_agent"
-    assert mock_call_groq.call_count == 2
+    assert isinstance(res, dict)
+    assert res["status"] == "quarantined"
+    assert "Initial planning call failed" in res["reason"]
+    assert mock_call_groq.call_count == 1
 
 @patch("finflow_agent.orchestrator.call_groq_json")
 def test_orchestrator_rejects_legacy_steps_response(mock_call_groq):
@@ -99,7 +88,7 @@ def test_orchestrator_rejects_legacy_steps_response(mock_call_groq):
     assert isinstance(res, dict)
     assert res["status"] == "quarantined"
     assert "Only PlanIntent is allowed" in res["reason"]
-    assert mock_call_groq.call_count == 3  # retried 3 times
+    assert mock_call_groq.call_count == 1
 
 
 def test_orchestrator_initializes_groq_client_without_proxy_kwargs(monkeypatch):

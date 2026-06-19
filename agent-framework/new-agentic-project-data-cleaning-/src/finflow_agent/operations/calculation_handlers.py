@@ -184,6 +184,21 @@ def calc_ratio(df: pd.DataFrame, op: CalculationOperation) -> Dict[str, Any]:
     df[out_col] = _round_series_if_currency(df[out_col], out_col)
     return {"df": df, "warnings": warnings}
 
+def calc_absolute_value(df: pd.DataFrame, op: CalculationOperation) -> Dict[str, Any]:
+    if op.column == "__all_numeric_columns__":
+        numeric_columns = list(df.select_dtypes(include=["number"]).columns)
+        for column in numeric_columns:
+            df[column] = df[column].abs()
+        return {
+            "df": df,
+            "warnings": [] if numeric_columns else ["absolute_value found no numeric columns to transform."],
+        }
+
+    _check_numeric(df, op.column)
+    out_col = op.output_column or op.column
+    df[out_col] = df[op.column].abs()
+    return {"df": df}
+
 CALCULATION_HANDLERS = {
     "sum": calc_sum,
     "mean": calc_mean,
@@ -200,5 +215,6 @@ CALCULATION_HANDLERS = {
     "running_total": calc_running_total,
     "percentage_change": calc_percentage_change,
     "difference": calc_difference,
-    "ratio": calc_ratio
+    "ratio": calc_ratio,
+    "absolute_value": calc_absolute_value,
 }

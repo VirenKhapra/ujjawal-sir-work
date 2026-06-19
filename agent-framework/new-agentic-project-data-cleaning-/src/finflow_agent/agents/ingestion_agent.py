@@ -86,7 +86,7 @@ class IngestionAgent:
                 metrics={
                     "row_count": row_count,
                     "column_count": column_count,
-                    "profile": profile
+                    "profile": profile.model_dump(mode="json")
                 }
             )
         except Exception as e:

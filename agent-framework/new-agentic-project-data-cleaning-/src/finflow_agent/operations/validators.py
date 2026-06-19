@@ -6,7 +6,7 @@ def validate_columns_exist(df: pd.DataFrame, columns: Any) -> None:
     """
     Validates that the specified columns exist in the DataFrame.
     """
-    if columns == "__all_string_columns__":
+    if isinstance(columns, str) and columns in {"__all_string_columns__", "__all_numeric_columns__"}:
         return
 
     if isinstance(columns, str):
@@ -35,11 +35,12 @@ def required_columns_for_operation(op) -> List[str]:
     required = []
 
     if hasattr(op, "column") and getattr(op, "column"):
-        required.append(op.column)
+        if op.column not in {"__all_string_columns__", "__all_numeric_columns__"}:
+            required.append(op.column)
 
     if hasattr(op, "columns"):
         cols = op.columns
-        if cols != "__all_string_columns__":
+        if cols not in {"__all_string_columns__", "__all_numeric_columns__"}:
             if isinstance(cols, str):
                 required.append(cols)
             elif isinstance(cols, list):

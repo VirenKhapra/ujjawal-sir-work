@@ -129,10 +129,10 @@ def execute_filter_plan(df: pd.DataFrame, plan: FilterOperationPlan) -> Executio
         
     if masks:
         final_mask = masks[0]
-        if plan.logic == "AND":
+        if plan.logic == "and":
             for m in masks[1:]:
                 final_mask = final_mask & m
-        elif plan.logic == "OR":
+        elif plan.logic == "or":
             for m in masks[1:]:
                 final_mask = final_mask | m
         output.data = output.data[final_mask]

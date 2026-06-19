@@ -8,9 +8,9 @@ or a ``PlanStep`` directly.
 
 The planning loop has two strictly separated phases:
 
-1. **LLM phase (retried)**: a small inner loop around the network round
-   trip that handles transient JSON parse / network / Pydantic-validation
-   errors. It produces either a validated :class:`PlanIntent` or a
+1. **LLM phase (bounded)**: one initial LLM call, followed by at most one
+   schema-aware repair call when validation errors are explicitly classified
+   as repairable. It produces either a validated :class:`PlanIntent` or a
    quarantine dict.
 2. **Compile phase (NOT retried)**: a deterministic translation of the
    intent into an ``ExecutionPlan``. Any failure here is final — re-running
@@ -42,8 +42,12 @@ Privacy and safety contract
   the canonical disabled-agent message.
 """
 
+import json
+import logging
 import os
 from typing import Any, Optional, Union
+
+from pydantic import ValidationError
 
 from finflow_agent.llm import call_groq_json  # noqa: F401  (kept for callers)
 from finflow_agent.planning.compiler import (
@@ -52,10 +56,23 @@ from finflow_agent.planning.compiler import (
     compile_intent_to_plan,
 )
 from finflow_agent.planning.intent_schema import PlanIntent
+from finflow_agent.planning.normalizer import (
+    COMPILER_VERSION,
+    NORMALIZER_VERSION,
+    PLAN_SCHEMA_VERSION,
+    normalize_plan_intent_payload,
+)
+from finflow_agent.planning.repair import (
+    build_repair_messages,
+    classify_plan_validation_error,
+    issues_are_repairable,
+)
 from finflow_agent.planning.validators import validate_plan
 from finflow_agent.state import ExecutionPlan
 from finflow_agent.tools.dataframe_profile import DataFrameProfile
 
+
+logger = logging.getLogger(__name__)
 
 # Canonical reason wording for the legacy ``steps`` rejection. Kept as a
 # module-level constant so the orchestrator's tests and the smoke harness can
@@ -113,6 +130,52 @@ The PlanIntent JSON shape:
   "reporting_title": null,
   "sheet_name": null
 }}
+
+CONDITIONAL PLAN RULES:
+- If ``needs_cleaning`` is true, ``cleaning_plan`` MUST be a non-null
+  ``CleaningOperationPlan`` with at least one cleaning operation.
+- If ``needs_filtering`` is true, ``filter_plan`` MUST be a non-null
+  ``FilterOperationPlan``.
+- If ``needs_calculation`` is true, ``calculation_plan`` MUST be a
+  non-null ``CalculationOperationPlan``.
+- If ``needs_visualization`` is true, ``visualization_plan`` MUST be a
+  non-null ``VisualizationOperationPlan``.
+- Never set a ``needs_X`` flag to true without also populating the
+  matching ``X_plan`` field.
+
+Example cleaning payload:
+{{
+  "needs_cleaning": true,
+  "cleaning_plan": {{
+    "operations": [
+      {{"type": "trim_whitespace", "columns": "__all_string_columns__"}},
+      {{"type": "normalize_column_names", "style": "snake_case"}},
+      {{"type": "drop_duplicates", "subset": null, "keep": "first"}}
+    ]
+  }}
+}}
+
+Cleaning operation rules:
+- For ``drop_duplicates``, omit ``subset`` or set it to ``null`` when duplicate
+  detection should use all columns. Never emit ``"__all_columns__"`` for
+  ``subset`` because ``subset`` is either ``null`` or a list of real column
+  names.
+
+Filter operation rules:
+- Use ``eq`` for equality comparisons. Never emit ``equals``.
+- Use ``neq`` for inequality comparisons. Never emit ``not_equals``.
+- Use only these filter operators: ``eq``, ``neq``, ``gt``, ``gte``, ``lt``,
+  ``lte``, ``contains``, ``not_contains``, ``starts_with``, ``ends_with``,
+  ``between``, ``in``, ``not_in``, ``is_null``, ``is_not_null``.
+
+Calculation operation rules:
+- Use only these calculation types: ``sum``, ``mean``, ``median``, ``min``,
+  ``max``, ``count``, ``count_distinct``, ``variance``,
+  ``standard_deviation``, ``group_sum``, ``group_mean``, ``group_count``,
+  ``running_total``, ``percentage_change``, ``difference``, ``ratio``,
+  ``absolute_value``.
+- For ``absolute_value`` across every numeric column, set ``column`` to
+  ``"__all_numeric_columns__"``.
 """
 
     # ------------------------------------------------------------------
@@ -127,6 +190,8 @@ The PlanIntent JSON shape:
         profile: Optional[DataFrameProfile] = None,
         output_dir: Optional[str] = None,
         file_prefix: Optional[str] = None,
+        job_id: Optional[str] = None,
+        submission_id: Optional[str] = None,
     ) -> Union[ExecutionPlan, dict]:
         """Build an ``ExecutionPlan`` for *instruction* + *file_name*, or
         return a quarantine dict when planning cannot proceed safely.
@@ -213,10 +278,14 @@ The PlanIntent JSON shape:
         raw_msg = [{"role": m.type, "content": m.content} for m in messages]
 
         # ----------------------------------------------------------------
-        # Phase 1: LLM call (with retries) -> validated PlanIntent or
-        # quarantine dict.
+        # Phase 1: LLM call -> normalization -> strict validation. If the
+        # validation failure is repairable, make exactly one targeted repair
+        # call with machine-readable feedback. There is no blind retry loop.
         # ----------------------------------------------------------------
-        intent_or_quarantine = self._get_validated_intent(raw_msg)
+        planning_context = {"job_id": job_id, "submission_id": submission_id}
+        intent_or_quarantine = self._get_validated_intent(
+            raw_msg, instruction, planning_context=planning_context
+        )
         if isinstance(intent_or_quarantine, dict):
             return intent_or_quarantine
         intent: PlanIntent = intent_or_quarantine
@@ -266,105 +335,241 @@ The PlanIntent JSON shape:
         return plan
 
     # ------------------------------------------------------------------
-    # Phase 1 helper: LLM round trip with retries.
+    # Phase 1 helper: LLM round trip with one schema-aware repair.
     # ------------------------------------------------------------------
     def _get_validated_intent(
         self,
         raw_msg: list,
+        instruction: str,
+        *,
+        planning_context: Optional[dict[str, Optional[str]]] = None,
     ) -> Union[PlanIntent, dict]:
-        """Ask the LLM for a ``PlanIntent`` and return it validated.
+        context = planning_context or {}
+        try:
+            result = self._invoke_llm(raw_msg)
+        except Exception as exc:  # noqa: BLE001 - provider boundary
+            self._log_planning_event(
+                context,
+                planning_attempt="initial",
+                validation_result="provider_error",
+                normalization_events=0,
+                repair_requested=False,
+                final_planning_status="quarantined",
+            )
+            return self._planning_failure(f"Initial planning call failed: {exc}")
 
-        The retry loop covers ONLY transient failures: network errors,
-        JSON parse errors, and Pydantic validation hiccups. The two
-        deterministic-failure conditions — a top-level ``steps`` key and
-        an ``is_quarantined`` intent — short-circuit on the very first
-        attempt and return a quarantine dict directly.
+        validation = self._validate_plan_intent_payload(result)
+        if validation.get("status") == "valid":
+            self._log_planning_event(
+                context,
+                planning_attempt="initial",
+                validation_result="valid",
+                normalization_events=len(validation["normalization_events"]),
+                repair_requested=False,
+                final_planning_status="validated",
+            )
+            return validation["intent"]
+        if validation.get("status") == "quarantined":
+            self._log_planning_event(
+                context,
+                planning_attempt="initial",
+                validation_result="quarantined",
+                normalization_events=len(validation.get("normalization_events", [])),
+                repair_requested=False,
+                final_planning_status="quarantined",
+            )
+            return validation
 
-        Returns either a validated :class:`PlanIntent` or a quarantine
-        dict shaped ``{"status": "quarantined", "reason": <str>}``.
-        """
-        max_retries = 3
-        last_error: Optional[str] = None
+        issues = validation["issues"]
+        if not issues_are_repairable(issues):
+            self._log_planning_event(
+                context,
+                planning_attempt="initial",
+                validation_result="invalid_unrepairable",
+                normalization_events=len(validation["normalization_events"]),
+                repair_requested=False,
+                final_planning_status="quarantined",
+            )
+            return self._planning_failure(
+                "Planning failed with unrepairable schema issues.",
+                original_validation_errors=validation["error"],
+                normalization_events=validation["normalization_events"],
+            )
 
-        for _attempt in range(max_retries):
-            try:
-                result = self._invoke_llm(raw_msg)
+        self._log_planning_event(
+            context,
+            planning_attempt="initial",
+            validation_result="invalid_repairable",
+            normalization_events=len(validation["normalization_events"]),
+            repair_requested=True,
+            final_planning_status="repair_requested",
+        )
+        repair_messages = build_repair_messages(
+            original_instruction=instruction,
+            invalid_payload=validation["normalized_payload"],
+            issues=issues,
+        )
+        try:
+            repaired = self._invoke_repair_llm(repair_messages)
+        except Exception as exc:  # noqa: BLE001 - provider boundary
+            self._log_planning_event(
+                context,
+                planning_attempt="repair",
+                validation_result="provider_error",
+                normalization_events=0,
+                repair_requested=True,
+                final_planning_status="quarantined",
+            )
+            return self._planning_failure(
+                f"Planning repair call failed: {exc}",
+                original_validation_errors=validation["error"],
+                normalization_events=validation["normalization_events"],
+            )
 
-                if not isinstance(result, dict):
-                    raise ValueError("LLM response is not a valid JSON object.")
+        repaired_validation = self._validate_plan_intent_payload(repaired)
+        if repaired_validation.get("status") == "valid":
+            self._log_planning_event(
+                context,
+                planning_attempt="repair",
+                validation_result="valid",
+                normalization_events=len(repaired_validation["normalization_events"]),
+                repair_requested=True,
+                final_planning_status="validated",
+            )
+            return repaired_validation["intent"]
+        if repaired_validation.get("status") == "quarantined":
+            self._log_planning_event(
+                context,
+                planning_attempt="repair",
+                validation_result="quarantined",
+                normalization_events=len(repaired_validation.get("normalization_events", [])),
+                repair_requested=True,
+                final_planning_status="quarantined",
+            )
+            return repaired_validation
 
-                # ----------------------------------------------------------
-                # Hard reject: legacy ``steps`` key.
-                #
-                # Per Requirements 1.1 and 11.1, the LLM is never allowed
-                # to emit an ``ExecutionPlan`` directly. Any response that
-                # contains a top-level ``steps`` key is malformed by
-                # contract — return a quarantine result IMMEDIATELY and do
-                # NOT retry. Constructing an ``ExecutionPlan`` in this
-                # branch is forbidden.
-                # ----------------------------------------------------------
-                if "steps" in result:
-                    return {
-                        "status": "quarantined",
-                        "reason": LEGACY_STEPS_QUARANTINE_REASON,
-                    }
+        self._log_planning_event(
+            context,
+            planning_attempt="repair",
+            validation_result="invalid_after_repair",
+            normalization_events=len(repaired_validation["normalization_events"]),
+            repair_requested=True,
+            final_planning_status="quarantined",
+        )
+        return self._planning_failure(
+            "Planning failed after one schema-aware repair attempt.",
+            original_validation_errors=validation["error"],
+            repair_validation_errors=repaired_validation["error"],
+            normalization_events=(
+                validation["normalization_events"]
+                + repaired_validation["normalization_events"]
+            ),
+        )
 
-                # Honor an LLM-driven quarantine on the raw response (older
-                # callers relied on this short-circuit). The validated-
-                # intent check below catches the same case after Pydantic
-                # coercion.
-                if result.get("is_quarantined"):
-                    return {
-                        "status": "quarantined",
-                        "reason": result.get("quarantine_reason")
-                        or "Request quarantined by Orchestrator.",
-                    }
+    def _validate_plan_intent_payload(self, result: Any) -> Union[PlanIntent, dict]:
+        if not isinstance(result, dict):
+            return {
+                "status": "invalid",
+                "error": "LLM response is not a valid JSON object.",
+                "issues": [],
+                "normalized_payload": {},
+                "normalization_events": [],
+            }
 
-                # Defensive remap: PlanIntent's Literal already forbids
-                # PDF, but if the LLM smuggled it in we coerce to xlsx
-                # before validation so the planning call still succeeds.
-                if result.get("output_format") == "pdf":
-                    result["output_format"] = "xlsx"
+        if "steps" in result:
+            return {
+                "status": "quarantined",
+                "reason": LEGACY_STEPS_QUARANTINE_REASON,
+                "normalization_events": [],
+            }
 
-                # Strict PlanIntent validation. Anything outside the
-                # schema raises a ValidationError that drops into the
-                # retry branch below.
-                intent = PlanIntent.model_validate(result)
+        if result.get("is_quarantined"):
+            return {
+                "status": "quarantined",
+                "reason": result.get("quarantine_reason")
+                or "Request quarantined by Orchestrator.",
+                "normalization_events": [],
+            }
 
-                # Defense-in-depth: even with structured-output binding,
-                # an LLM bug or schema-bypass attempt could still smuggle
-                # a ``steps`` key through. Re-check after Pydantic
-                # coercion (which would have dropped unknown fields by
-                # default, but we don't rely on that).
-                if "steps" in intent.model_dump():
-                    return {
-                        "status": "quarantined",
-                        "reason": LEGACY_STEPS_QUARANTINE_REASON,
-                    }
+        normalization = normalize_plan_intent_payload(result)
+        try:
+            intent = PlanIntent.model_validate(normalization.payload)
+        except ValidationError as exc:
+            return {
+                "status": "invalid",
+                "error": str(exc),
+                "issues": classify_plan_validation_error(exc),
+                "normalized_payload": normalization.payload,
+                "normalization_events": normalization.events,
+            }
 
-                # Re-check the validated intent. This guards against an
-                # LLM that emits ``is_quarantined`` only after Pydantic
-                # coercion (e.g., the field was ``"true"`` as a string).
-                if intent.is_quarantined:
-                    return {
-                        "status": "quarantined",
-                        "reason": intent.quarantine_reason
-                        or "Request quarantined by Orchestrator.",
-                    }
-
-                return intent
-
-            except Exception as exc:  # noqa: BLE001 - intentional: retry loop
-                last_error = str(exc)
-                continue
+        if intent.is_quarantined:
+            return {
+                "status": "quarantined",
+                "reason": intent.quarantine_reason
+                or "Request quarantined by Orchestrator.",
+                "normalization_events": normalization.events,
+            }
 
         return {
-            "status": "quarantined",
-            "reason": (
-                f"Failed to generate a valid execution plan after "
-                f"{max_retries} attempts. Last error: {last_error}"
-            ),
+            "status": "valid",
+            "intent": intent,
+            "normalization_events": normalization.events,
         }
+
+    def _log_planning_event(
+        self,
+        context: dict[str, Optional[str]],
+        *,
+        planning_attempt: str,
+        validation_result: str,
+        normalization_events: int,
+        repair_requested: bool,
+        final_planning_status: str,
+    ) -> None:
+        logger.info(
+            "Planning boundary event job_id=%s submission_id=%s planning_attempt=%s "
+            "normalizer_version=%s number_of_normalization_events=%s "
+            "validation_result=%s repair_requested=%s final_planning_status=%s",
+            context.get("job_id"),
+            context.get("submission_id"),
+            planning_attempt,
+            NORMALIZER_VERSION,
+            normalization_events,
+            validation_result,
+            repair_requested,
+            final_planning_status,
+        )
+
+    def _planning_failure(self, reason: str, **details: Any) -> dict:
+        summary = {
+            "reason": reason,
+            "plan_schema_version": PLAN_SCHEMA_VERSION,
+            "normalizer_version": NORMALIZER_VERSION,
+            "compiler_version": COMPILER_VERSION,
+        }
+        summary.update(details)
+        return {
+            "status": "quarantined",
+            "reason": reason,
+            "summary": summary,
+        }
+
+    def _invoke_repair_llm(self, messages: list[dict[str, Any]]) -> dict:
+        repair_messages = [
+            {
+                "role": message["role"],
+                "content": (
+                    message["content"]
+                    if isinstance(message["content"], str)
+                    else json.dumps(message["content"], default=str)
+                ),
+            }
+            for message in messages
+        ]
+        import finflow_agent.orchestrator as root_orchestrator
+
+        return root_orchestrator.call_groq_json(repair_messages, schema={})
 
     # ------------------------------------------------------------------
     # LLM invocation seam.
@@ -420,8 +625,7 @@ The PlanIntent JSON shape:
             if isinstance(structured, dict):
                 return structured
             # Any other shape is a contract violation; surface it as a
-            # transient error so the retry loop can give the LLM another
-            # chance.
+            # controlled planning failure at the LLM boundary.
             raise ValueError(
                 f"Structured LLM returned unexpected type "
                 f"{type(structured).__name__}; expected PlanIntent or dict."

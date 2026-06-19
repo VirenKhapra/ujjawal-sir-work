@@ -560,6 +560,276 @@ async def test_callback_failure_marks_callback_failed():
     job = await repo.get_job(job_id)
     assert job["status"] == "CALLBACK_FAILED"
 
+
+def test_callback_payload_serializer_handles_dataframe_profile():
+    from finflow_agent.jobs.callbacks import make_json_safe
+
+    profile = profile_dataframe(
+        pd.DataFrame({"Gender": ["Female", "Female"], "Age": [46, 52]}),
+        include_samples=False,
+    )
+
+    safe_payload = make_json_safe(
+        {
+            "status": "complete",
+            "summary": {
+                "agent_summaries": [
+                    {
+                        "agent": "ingestion_agent",
+                        "metrics": {"profile": profile},
+                    }
+                ]
+            },
+        }
+    )
+
+    assert safe_payload["summary"]["agent_summaries"][0]["metrics"]["profile"][
+        "row_count"
+    ] == 2
+    assert isinstance(
+        safe_payload["summary"]["agent_summaries"][0]["metrics"]["profile"],
+        dict,
+    )
+
+
+def test_callback_identity_is_stable_for_same_payload():
+    from finflow_agent.api import _attach_callback_identity
+
+    first = _attach_callback_identity(
+        {"status": "failed", "output_path": None, "summary": {"error": "x"}},
+        job_id="agent:sub-1",
+        submission_id="sub-1",
+    )
+    second = _attach_callback_identity(
+        {"status": "failed", "output_path": None, "summary": {"error": "x"}},
+        job_id="agent:sub-1",
+        submission_id="sub-1",
+    )
+
+    assert first["job_id"] == "agent:sub-1"
+    assert first["event_id"] == second["event_id"]
+    assert first["event_id"].startswith("agent:sub-1:")
+
+
+def test_filter_condition_normalizes_equals_operator():
+    from finflow_agent.planning.normalizer import normalize_plan_intent_payload
+
+    result = normalize_plan_intent_payload(
+        {
+            "filter_plan": {
+                "conditions": [
+                    {"column": "status", "operator": "equals", "value": "Paid"}
+                ]
+            }
+        }
+    )
+    assert result.payload["filter_plan"]["conditions"][0]["operator"] == "eq"
+
+
+def test_absolute_value_operation_accepts_all_numeric_columns_alias():
+    from finflow_agent.planning.normalizer import normalize_plan_intent_payload
+
+    result = normalize_plan_intent_payload(
+        {
+            "calculation_plan": {
+                "operations": [
+                    {"type": "absolute_value", "columns": "__all_numeric_columns__"}
+                ]
+            }
+        }
+    )
+    assert result.payload["calculation_plan"]["operations"][0] == {
+        "type": "absolute_value",
+        "column": "__all_numeric_columns__",
+    }
+
+
+def test_execute_absolute_value_over_all_numeric_columns():
+    from finflow_agent.operations.executor import execute_calculation_plan
+    from finflow_agent.operations.schemas import CalculationOperationPlan, CalculationOperation
+
+    df = pd.DataFrame(
+        {"amount": [-10, 20], "balance": [-5.5, 3.2], "status": ["A", "B"]}
+    )
+    plan = CalculationOperationPlan(
+        operations=[
+            CalculationOperation(
+                type="absolute_value",
+                column="__all_numeric_columns__",
+            )
+        ]
+    )
+
+    output = execute_calculation_plan(df, plan)
+    assert output.data["amount"].tolist() == [10, 20]
+    assert output.data["balance"].tolist() == [5.5, 3.2]
+    assert output.data["status"].tolist() == ["A", "B"]
+
+
+@pytest.mark.anyio
+async def test_e2e_job_normalizes_aliases_executes_and_sends_callback(monkeypatch, tmp_path):
+    from finflow_agent.api import process_job_task
+    from finflow_agent.jobs.repository import JobRepository
+
+    bootstrap_agents()
+    upload_dir = tmp_path / "uploads"
+    output_dir = tmp_path / "outputs"
+    upload_dir.mkdir()
+    output_dir.mkdir()
+    (upload_dir / "credits.csv").write_text(
+        "Name,Credit,Note\n"
+        " Alice ,50000, paid \n"
+        " Bob ,10000, hold \n"
+        " Cara ,60000, paid \n"
+    )
+
+    callback_payloads = []
+
+    async def fake_callback(payload, job_id, repository):
+        callback_payloads.append(payload)
+
+    monkeypatch.setenv("UPLOAD_DIR", str(upload_dir))
+    monkeypatch.setenv("OUTPUT_DIR", str(output_dir))
+    monkeypatch.setattr(
+        "finflow_agent.orchestrator.call_groq_json",
+        lambda _messages, schema=None: {
+            "schema_version": "1.0",
+            "needs_cleaning": True,
+            "cleaning_plan": {
+                "operations": [
+                    {"type": "trim_spaces", "columns": "__all_string_columns__"}
+                ]
+            },
+            "needs_filtering": True,
+            "filter_plan": {
+                "conditions": [
+                    {"column": "Credit", "operator": "greater_than", "value": 40000}
+                ],
+                "logic": "AND",
+            },
+            "output_format": "csv",
+        },
+    )
+    monkeypatch.setattr("finflow_agent.jobs.callbacks.send_backend_callback", fake_callback)
+
+    repository = JobRepository(db_path=str(tmp_path / "jobs.json"))
+    job_id = "agent:e2e_aliases"
+    await repository.create_or_update_queued(
+        job_id,
+        "e2e_aliases",
+        {
+            "submission_id": "e2e_aliases",
+            "file_id": "credits.csv",
+            "file_name": "credits.csv",
+            "instruction": "Clean this data and show credited transactions above 40000",
+            "output_format": "csv",
+        },
+    )
+
+    await process_job_task(
+        {"repository": repository},
+        {
+            "submission_id": "e2e_aliases",
+            "file_id": "credits.csv",
+            "file_name": "credits.csv",
+            "instruction": "Clean this data and show credited transactions above 40000",
+            "output_format": "csv",
+        },
+    )
+
+    job = await repository.get_job(job_id)
+    assert job["status"] == "SUCCEEDED"
+    assert callback_payloads
+    callback = callback_payloads[0]
+    assert callback["status"] == "complete"
+    assert callback["event_id"].startswith("agent:e2e_aliases:")
+    assert Path(callback["output_path"]).exists()
+    output_df = pd.read_csv(callback["output_path"])
+    assert output_df["Credit"].tolist() == [50000, 60000]
+    assert output_df["Name"].tolist() == ["Alice", "Cara"]
+
+
+@pytest.mark.anyio
+async def test_e2e_job_quarantines_after_failed_schema_repair(monkeypatch, tmp_path):
+    from finflow_agent.api import process_job_task
+    from finflow_agent.jobs.repository import JobRepository
+
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    (upload_dir / "credits.csv").write_text("Name,Credit\nAlice,50000\n")
+
+    callback_payloads = []
+    llm_calls = []
+
+    def fake_llm(_messages, schema=None):
+        llm_calls.append(1)
+        return {
+            "schema_version": "1.0",
+            "needs_filtering": True,
+            "filter_plan": {
+                "conditions": {"column": "Credit", "operator": "gt", "value": 40000},
+                "logic": "and",
+            },
+            "output_format": "csv",
+        }
+
+    async def fake_callback(payload, job_id, repository):
+        callback_payloads.append(payload)
+
+    monkeypatch.setenv("UPLOAD_DIR", str(upload_dir))
+    monkeypatch.setattr("finflow_agent.orchestrator.call_groq_json", fake_llm)
+    monkeypatch.setattr("finflow_agent.jobs.callbacks.send_backend_callback", fake_callback)
+
+    repository = JobRepository(db_path=str(tmp_path / "jobs.json"))
+    job_id = "agent:e2e_repair_fail"
+    payload = {
+        "submission_id": "e2e_repair_fail",
+        "file_id": "credits.csv",
+        "file_name": "credits.csv",
+        "instruction": "show credited transactions above 40000",
+        "output_format": "csv",
+    }
+    await repository.create_or_update_queued(job_id, "e2e_repair_fail", payload)
+
+    await process_job_task({"repository": repository}, payload)
+
+    job = await repository.get_job(job_id)
+    assert job["status"] == "QUARANTINED"
+    assert len(llm_calls) == 2
+    assert callback_payloads[0]["status"] == "quarantined"
+    assert "schema-aware repair" in callback_payloads[0]["summary"]["reason"]
+
+
+@pytest.mark.anyio
+async def test_send_backend_callback_posts_json_safe_payload_with_dataframe_profile():
+    from finflow_agent.jobs.callbacks import send_backend_callback
+
+    profile = profile_dataframe(pd.DataFrame({"A": [1, 2]}), include_samples=False)
+    posted = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = "ok"
+
+    class FakeRepository:
+        async def mark_callback_failed(self, job_id):
+            raise AssertionError("callback should not be marked failed")
+
+    async def fake_post(self, url, json, headers):
+        posted["payload"] = json
+        return FakeResponse()
+
+    with patch("httpx.AsyncClient.post", new=fake_post):
+        await send_backend_callback(
+            {"status": "complete", "summary": {"profile": profile}},
+            "agent:json-safe",
+            FakeRepository(),
+        )
+
+    assert isinstance(posted["payload"]["summary"]["profile"], dict)
+    assert posted["payload"]["summary"]["profile"]["row_count"] == 2
+
+
 @pytest.mark.anyio
 async def test_job_lifecycle_status_updates():
     from finflow_agent.jobs.repository import JobRepository
@@ -691,7 +961,11 @@ def test_compiler_rejects_missing_cleaning_plan():
     from finflow_agent.planning.compiler import compile_intent_to_plan
     from finflow_agent.planning.intent_schema import PlanIntent
     
-    intent = PlanIntent(needs_cleaning=True, cleaning_plan=None)
+    intent = PlanIntent.model_construct(
+        needs_cleaning=True,
+        cleaning_plan=None,
+        output_format="xlsx",
+    )
     with pytest.raises(ValueError) as exc:
         compile_intent_to_plan(intent, "test.csv", "csv", "out", "pref")
     assert "cleaning_plan is missing" in str(exc.value)
@@ -700,7 +974,11 @@ def test_compiler_rejects_missing_filter_plan():
     from finflow_agent.planning.compiler import compile_intent_to_plan
     from finflow_agent.planning.intent_schema import PlanIntent
     
-    intent = PlanIntent(needs_filtering=True, filter_plan=None)
+    intent = PlanIntent.model_construct(
+        needs_filtering=True,
+        filter_plan=None,
+        output_format="xlsx",
+    )
     with pytest.raises(ValueError) as exc:
         compile_intent_to_plan(intent, "test.csv", "csv", "out", "pref")
     assert "filter_plan is missing" in str(exc.value)
@@ -709,7 +987,11 @@ def test_compiler_rejects_missing_calculation_plan():
     from finflow_agent.planning.compiler import compile_intent_to_plan
     from finflow_agent.planning.intent_schema import PlanIntent
     
-    intent = PlanIntent(needs_calculation=True, calculation_plan=None)
+    intent = PlanIntent.model_construct(
+        needs_calculation=True,
+        calculation_plan=None,
+        output_format="xlsx",
+    )
     with pytest.raises(ValueError) as exc:
         compile_intent_to_plan(intent, "test.csv", "csv", "out", "pref")
     assert "calculation_plan is missing" in str(exc.value)
@@ -718,7 +1000,11 @@ def test_compiler_rejects_missing_visualization_plan():
     from finflow_agent.planning.compiler import compile_intent_to_plan
     from finflow_agent.planning.intent_schema import PlanIntent
     
-    intent = PlanIntent(needs_visualization=True, visualization_plan=None)
+    intent = PlanIntent.model_construct(
+        needs_visualization=True,
+        visualization_plan=None,
+        output_format="xlsx",
+    )
     with pytest.raises(ValueError) as exc:
         compile_intent_to_plan(intent, "test.csv", "csv", "out", "pref")
     assert "visualization_plan is missing" in str(exc.value)
@@ -985,13 +1271,6 @@ def test_bootstrap_agents_does_not_require_langchain_groq_at_import_time():
     # Restore original sys.modules states for LLM modules
     for mod, val in original_llm_states.items():
         sys.modules[mod] = val
-
-
-
-
-
-
-
 
 
 

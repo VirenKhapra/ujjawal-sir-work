@@ -27,6 +27,8 @@ import pytest
 from finflow_agent.agents.filter_agent import FilterAgent, FilterAgentParams
 from finflow_agent.operations.schemas import FilterCondition, FilterOperationPlan
 from finflow_agent.tools import config as config_module
+from finflow_agent.tools.column_resolver import resolve_column
+from finflow_agent.tools.dataframe_profile import profile_dataframe
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +38,7 @@ from finflow_agent.tools import config as config_module
 
 def _plan_dict(
     conditions: List[Dict[str, Any]],
-    logic: str = "AND",
+    logic: str = "and",
     select_columns=None,
     limit=None,
 ) -> Dict[str, Any]:
@@ -44,6 +46,7 @@ def _plan_dict(
 
     The agent re-validates the dict via ``FilterOperationPlan.model_validate``,
     so feeding the raw dict reproduces the compiler-emitted code path.
+    Note: FilterOperationPlan.logic is Literal["and", "or"] (lowercase).
     """
     plan: Dict[str, Any] = {"conditions": conditions, "logic": logic}
     if select_columns is not None:
@@ -256,7 +259,7 @@ def test_filter_agent_high_confidence_match_applies_filter(bootstrap_agents):
             _eq("gender", "female", case_sensitive=False),
             _eq("age", 45),
         ],
-        logic="AND",
+        logic="and",
     )
 
     result = FilterAgent().execute({"plan": plan}, {"input_dataframe": df})
@@ -376,3 +379,13 @@ def test_filter_agent_rewrites_condition_column_to_resolved_match(
     # invoking the deterministic executor, so filtering succeeded.
     assert isinstance(result.data, pd.DataFrame)
     assert "Gender" in result.data.columns
+
+
+def test_column_resolver_canonicalizes_placeholder_wrappers():
+    df = pd.DataFrame({"payment_method": ["Card", "PayPal"]})
+    profile = profile_dataframe(df, include_samples=False)
+
+    resolution = resolve_column("__payment_method_column__", profile)
+
+    assert resolution.matched_column == "payment_method"
+    assert resolution.confidence == pytest.approx(1.0)

@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field, model_validator
 
 # -------------------------------------------------------------------
@@ -87,12 +87,27 @@ class ReorderColumnsOperation(BaseOperation):
     type: Literal["reorder_columns"] = "reorder_columns"
     columns: List[str]
 
-CleaningOperationType = Union[
-    TrimWhitespaceOperation, NormalizeColumnNamesOperation, DropDuplicatesOperation,
-    FillNullsOperation, DropNullsOperation, NormalizeDateOperation, NormalizeCurrencyOperation,
-    NormalizeNumberOperation, NormalizeTextCaseOperation, ReplaceValuesOperation,
-    StripCurrencySymbolsOperation, RemoveCommasFromNumbersOperation, CoerceColumnTypeOperation,
-    RemoveEmptyRowsOperation, RemoveEmptyColumnsOperation, RenameColumnsOperation, ReorderColumnsOperation
+CleaningOperationType = Annotated[
+    Union[
+        TrimWhitespaceOperation,
+        NormalizeColumnNamesOperation,
+        DropDuplicatesOperation,
+        FillNullsOperation,
+        DropNullsOperation,
+        NormalizeDateOperation,
+        NormalizeCurrencyOperation,
+        NormalizeNumberOperation,
+        NormalizeTextCaseOperation,
+        ReplaceValuesOperation,
+        StripCurrencySymbolsOperation,
+        RemoveCommasFromNumbersOperation,
+        CoerceColumnTypeOperation,
+        RemoveEmptyRowsOperation,
+        RemoveEmptyColumnsOperation,
+        RenameColumnsOperation,
+        ReorderColumnsOperation,
+    ],
+    Field(discriminator="type"),
 ]
 
 class CleaningOperationPlan(BaseModel):
@@ -133,7 +148,7 @@ class FilterCondition(BaseModel):
 
 class FilterOperationPlan(BaseModel):
     conditions: List[FilterCondition] = Field(default_factory=list)
-    logic: Literal["AND", "OR"] = "AND"
+    logic: Literal["and", "or"] = "and"
     select_columns: Optional[List[str]] = None
     limit: Optional[int] = None
 
@@ -143,7 +158,7 @@ class FilterOperationPlan(BaseModel):
 class CalculationOperation(BaseModel):
     type: Literal["sum", "mean", "median", "min", "max", "count", "count_distinct", 
                   "variance", "standard_deviation", "group_sum", "group_mean", "group_count", 
-                  "running_total", "percentage_change", "difference", "ratio"]
+                  "running_total", "percentage_change", "difference", "ratio", "absolute_value"]
     column: str
     output_column: Optional[str] = None
     group_by: Optional[List[str]] = None

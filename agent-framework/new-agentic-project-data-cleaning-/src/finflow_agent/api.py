@@ -1,6 +1,8 @@
 import os
 import json
 import httpx
+import hashlib
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -12,6 +14,9 @@ from arq import create_pool
 from arq.connections import RedisSettings
 from finflow_agent.jobs.repository import JobRepository
 from finflow_agent.storage.file_store import FileStore
+
+
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -34,6 +39,23 @@ class JobPayload(BaseModel):
     instruction: str
     output_format: str
 
+
+def _attach_callback_identity(result_payload: dict, *, job_id: str, submission_id: str) -> dict:
+    result_payload["submission_id"] = submission_id
+    result_payload["job_id"] = job_id
+    stable_payload = {
+        "submission_id": submission_id,
+        "job_id": job_id,
+        "status": result_payload.get("status"),
+        "output_path": result_payload.get("output_path"),
+        "summary": result_payload.get("summary"),
+    }
+    stable_json = json.dumps(stable_payload, sort_keys=True, default=str)
+    digest = hashlib.sha256(stable_json.encode("utf-8")).hexdigest()
+    result_payload["event_id"] = f"{job_id}:{digest}"
+    return result_payload
+
+
 async def process_job_task(ctx, payload_dict: dict):
     submission_id = payload_dict["submission_id"]
     job_id = f"agent:{submission_id}"
@@ -55,6 +77,7 @@ async def process_job_task(ctx, payload_dict: dict):
             "output_path": None,
             "summary": {"reason": reason}
         }
+        _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
         from finflow_agent.jobs.callbacks import send_backend_callback
         await send_backend_callback(result_payload, job_id, repository)
         return
@@ -70,12 +93,20 @@ async def process_job_task(ctx, payload_dict: dict):
         file_name=payload_dict["file_name"],
         output_format=payload_dict["output_format"],
         output_dir=os.environ.get("OUTPUT_DIR", "outputs"),
-        file_prefix=file_prefix
+        file_prefix=file_prefix,
+        job_id=job_id,
+        submission_id=submission_id,
     )
 
     
     if isinstance(plan_or_dict, dict) and plan_or_dict.get("status") == "quarantined":
         reason = plan_or_dict.get("reason") or "Request quarantined by Orchestrator."
+        logger.info(
+            "Agent job planning quarantined job_id=%s submission_id=%s reason=%s",
+            job_id,
+            submission_id,
+            reason,
+        )
         await repository.mark_quarantined(job_id, reason)
         result_payload = {
             "submission_id": submission_id,
@@ -83,16 +114,22 @@ async def process_job_task(ctx, payload_dict: dict):
             "output_path": None,
             "summary": {"reason": reason}
         }
+        _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
         from finflow_agent.jobs.callbacks import send_backend_callback
         await send_backend_callback(result_payload, job_id, repository)
         return
         
     try:
         await repository.mark_running(job_id)
+        logger.info(
+            "Agent job execution started job_id=%s submission_id=%s",
+            job_id,
+            submission_id,
+        )
         
         engine = ExecutionEngine()
         result_payload = engine.execute(plan_or_dict)
-        result_payload["submission_id"] = submission_id
+        _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
         
         if result_payload.get("status") != "complete":
             await repository.mark_failed(
@@ -111,6 +148,7 @@ async def process_job_task(ctx, payload_dict: dict):
                         "engine_result": result_payload
                     }
                 }
+                _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
                 await repository.mark_failed(job_id, "Complete job missing output_path")
             else:
                 await repository.mark_succeeded(job_id, result_payload)
@@ -122,6 +160,7 @@ async def process_job_task(ctx, payload_dict: dict):
             "output_path": None,
             "summary": {"error": str(e)}
         }
+        _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
 
         
     from finflow_agent.jobs.callbacks import send_backend_callback

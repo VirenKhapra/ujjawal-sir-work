@@ -1,12 +1,14 @@
 import logging
 import json
-from datetime import datetime
+import hashlib
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Header, HTTPException, Request, Response, UploadFile, status
 from pydantic import BaseModel
 from sqlalchemy import inspect, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -14,7 +16,7 @@ from app.api.uploads import save_upload
 from app.core.config import get_settings
 from app.core.security import create_access_token, find_user_by_email, get_optional_user, require_roles, verify_password
 from app.db.session import get_db
-from app.models import AuditAction, DeadLetterJob, NeedsReviewJob, RegisteredAgent, ReviewStatus, Submission, SubmissionStatus, User, UserRole
+from app.models import AuditAction, CallbackEvent, DeadLetterJob, NeedsReviewJob, RegisteredAgent, ReviewStatus, Submission, SubmissionStatus, User, UserRole
 from app.schemas import AgentRead, AgentRegisterRequest, AgentTokenResponse, LoginRequest, UploadPreview
 from app.services.alerts import create_quarantine_alert
 from app.services.audit import log_action
@@ -26,6 +28,10 @@ from app.services.websocket_manager import ws_manager
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 logger = logging.getLogger(__name__)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 def _clean_error_text(value: object) -> str:
@@ -195,7 +201,7 @@ async def register_agent(
         existing.output_formats = [item.strip().upper() for item in payload.output_formats if item.strip()]
         existing.endpoint_url = payload.endpoint_url.strip() if payload.endpoint_url else None
         existing.status = payload.status.strip().lower() or existing.status or "active"
-        existing.last_heartbeat = datetime.utcnow()
+        existing.last_heartbeat = _utc_now()
         await db.commit()
         await db.refresh(existing)
         requeued_ids = await requeue_quarantined_submissions(db)
@@ -261,6 +267,145 @@ class AgentCallbackPayload(BaseModel):
     status: str
     output_path: str | None = None
     summary: dict | None = None
+    event_id: str | None = None
+    job_id: str | None = None
+
+
+def _callback_payload_hash(payload: AgentCallbackPayload) -> str:
+    payload_json = json.dumps(payload.model_dump(), sort_keys=True, default=str)
+    return hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+
+
+def _derive_callback_event_id(payload: AgentCallbackPayload) -> str:
+    if _clean_error_text(payload.event_id):
+        return _clean_error_text(payload.event_id)
+    stable_payload = {
+        "submission_id": payload.submission_id,
+        "status": payload.status,
+        "output_path": payload.output_path,
+        "summary": payload.summary,
+    }
+    stable_json = json.dumps(stable_payload, sort_keys=True, default=str)
+    digest = hashlib.sha256(stable_json.encode("utf-8")).hexdigest()
+    return f"callback:{payload.submission_id}:{digest}"
+
+
+async def _mark_callback_side_effect_failed(
+    db: AsyncSession,
+    *,
+    event_id: str,
+    error: str,
+) -> None:
+    event = (
+        await db.execute(select(CallbackEvent).where(CallbackEvent.event_id == event_id))
+    ).scalar_one_or_none()
+    if event:
+        event.processing_status = "side_effect_failed"
+        event.last_error = error[:2000]
+        await db.commit()
+
+
+async def _persist_needs_review_side_effect(
+    *,
+    db: AsyncSession,
+    payload: AgentCallbackPayload,
+    submission: Submission,
+    event_id: str,
+    settings,
+) -> str:
+    if not settings.enable_needs_review_jobs:
+        logger.info(
+            "Skipping needs_review_jobs insert event_id=%s submission_id=%s feature_enabled=false",
+            event_id,
+            submission.id,
+        )
+        return "disabled"
+
+    try:
+        if not await _table_exists(db, NeedsReviewJob.__tablename__):
+            raise RuntimeError("Database schema missing needs_review_jobs table")
+        review_reason = "Domain not supported"
+        if isinstance(payload.summary, dict):
+            review_reason = (
+                _clean_error_text(payload.summary.get("reason"))
+                or _clean_error_text(payload.summary.get("error"))
+                or review_reason
+            )
+        db.add(
+            NeedsReviewJob(
+                submission_id=submission.id,
+                source_event_id=event_id,
+                reason=review_reason,
+            )
+        )
+        await db.commit()
+        return "created"
+    except IntegrityError:
+        await db.rollback()
+        logger.info(
+            "Callback side effect duplicate event_id=%s job_id=%s submission_id=%s side_effect_type=needs_review_job side_effect_status=duplicate",
+            event_id,
+            payload.job_id,
+            submission.id,
+        )
+        return "duplicate"
+    except Exception as exc:
+        await db.rollback()
+        logger.exception(
+            "Callback side effect failed event_id=%s submission_id=%s side_effect_type=needs_review_job table=%s exception=%s message=%s",
+            event_id,
+            submission.id,
+            NeedsReviewJob.__tablename__,
+            exc.__class__.__name__,
+            _clean_error_text(exc),
+        )
+        await _mark_callback_side_effect_failed(db, event_id=event_id, error=str(exc))
+        return "failed"
+
+
+async def _persist_dead_letter_side_effect(
+    *,
+    db: AsyncSession,
+    payload: AgentCallbackPayload,
+    submission: Submission,
+    event_id: str,
+) -> str:
+    try:
+        if not await _table_exists(db, DeadLetterJob.__tablename__):
+            raise RuntimeError("Database schema missing dead_letter_jobs table")
+        error_detail = "Execution failed"
+        if isinstance(payload.summary, dict):
+            error_detail = _clean_error_text(payload.summary.get("error")) or error_detail
+        db.add(
+            DeadLetterJob(
+                submission_id=submission.id,
+                source_event_id=event_id,
+                error_detail=error_detail,
+            )
+        )
+        await db.commit()
+        return "created"
+    except IntegrityError:
+        await db.rollback()
+        logger.info(
+            "Callback side effect duplicate event_id=%s job_id=%s submission_id=%s side_effect_type=dead_letter_job side_effect_status=duplicate",
+            event_id,
+            payload.job_id,
+            submission.id,
+        )
+        return "duplicate"
+    except Exception as exc:
+        await db.rollback()
+        logger.exception(
+            "Callback side effect failed event_id=%s submission_id=%s side_effect_type=dead_letter_job table=%s exception=%s message=%s",
+            event_id,
+            submission.id,
+            DeadLetterJob.__tablename__,
+            exc.__class__.__name__,
+            _clean_error_text(exc),
+        )
+        await _mark_callback_side_effect_failed(db, event_id=event_id, error=str(exc))
+        return "failed"
 
 @router.post("/callback")
 async def agent_callback(
@@ -278,17 +423,66 @@ async def agent_callback(
         if request.headers.get("x-agent-callback-secret") != settings.agent_callback_secret:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent callback secret")
 
-    submission = (
-        await db.execute(
-            select(Submission)
-            .options(selectinload(Submission.user))
-            .where(Submission.id == UUID(payload.submission_id))
-        )
+    submission_id = UUID(payload.submission_id)
+    event_id = _derive_callback_event_id(payload)
+    payload_hash = _callback_payload_hash(payload)
+
+    existing_event = (
+        await db.execute(select(CallbackEvent).where(CallbackEvent.event_id == event_id))
     ).scalar_one_or_none()
-    if not submission:
-        raise HTTPException(status_code=404, detail="Submission not found")
+    if existing_event and existing_event.processing_status in {"completed", "side_effect_failed"}:
+        logger.info(
+            "Callback idempotent replay event_id=%s job_id=%s submission_id=%s primary_commit_status=already_completed idempotent_replay=true",
+            event_id,
+            payload.job_id,
+            payload.submission_id,
+        )
+        submission = (
+            await db.execute(
+                select(Submission)
+                .options(selectinload(Submission.user))
+                .where(Submission.id == submission_id)
+            )
+        ).scalar_one_or_none()
+        if not submission:
+            raise HTTPException(status_code=404, detail="Submission not found")
+        ws_payload = {
+            "upload_id": str(submission.id),
+            "filename": submission.file_name,
+            "status": submission.status,
+            "output_ready": bool(submission.output_path),
+        }
+        return {
+            "message": "Callback accepted",
+            "accepted": True,
+            "primary_state_persisted": True,
+            "idempotent_replay": True,
+            "side_effects": {},
+            **ws_payload,
+        }
 
     try:
+        submission = (
+            await db.execute(
+                select(Submission)
+                .options(selectinload(Submission.user))
+                .where(Submission.id == submission_id)
+            )
+        ).scalar_one_or_none()
+        if not submission:
+            raise HTTPException(status_code=404, detail="Submission not found")
+
+        callback_event = existing_event or CallbackEvent(
+            event_id=event_id,
+            job_id=payload.job_id,
+            submission_id=submission.id,
+            event_type=payload.status,
+            payload_hash=payload_hash,
+            processing_status="processing",
+        )
+        if existing_event is None:
+            db.add(callback_event)
+
         submission.status = map_agent_status_to_submission_status(payload.status)
         summary_has_error = False
         if isinstance(payload.summary, dict):
@@ -302,39 +496,79 @@ async def agent_callback(
         submission.summary = payload.summary
         if payload.output_path:
             submission.output_path = payload.output_path
-        submission.completed_at = datetime.utcnow()
-
-        if submission.status == SubmissionStatus.quarantined:
-            if not settings.enable_needs_review_jobs:
-                logger.info("Skipping needs_review_jobs insert because the feature is disabled.")
-            else:
-                if not await _table_exists(db, NeedsReviewJob.__tablename__):
-                    raise RuntimeError("Database schema missing needs_review_jobs table")
-                review_reason = "Domain not supported"
-                if isinstance(payload.summary, dict):
-                    review_reason = (
-                        _clean_error_text(payload.summary.get("reason"))
-                        or _clean_error_text(payload.summary.get("error"))
-                        or review_reason
-                    )
-                db.add(NeedsReviewJob(submission_id=submission.id, reason=review_reason))
-        elif submission.status in {SubmissionStatus.failed, SubmissionStatus.callback_failed}:
-            error_detail = "Execution failed"
-            if isinstance(payload.summary, dict):
-                error_detail = _clean_error_text(payload.summary.get("error")) or error_detail
-            db.add(DeadLetterJob(submission_id=submission.id, error_detail=error_detail))
+        submission.completed_at = _utc_now()
+        callback_event.processing_status = "completed"
+        callback_event.processed_at = _utc_now()
+        callback_event.last_error = None
 
         await db.commit()
+        logger.info(
+            "Callback primary persisted event_id=%s job_id=%s submission_id=%s primary_commit_status=committed idempotent_replay=false",
+            event_id,
+            payload.job_id,
+            submission.id,
+        )
     except HTTPException:
         raise
+    except IntegrityError as exc:
+        await db.rollback()
+        logger.warning(
+            "Duplicate callback event race event_id=%s submission_id=%s error=%s",
+            event_id,
+            payload.submission_id,
+            exc.__class__.__name__,
+        )
+        return {
+            "message": "Callback accepted",
+            "accepted": True,
+            "primary_state_persisted": True,
+            "idempotent_replay": True,
+            "side_effects": {},
+        }
     except Exception as exc:
         await db.rollback()
-        logger.exception("Failed to persist agent callback for submission %s", payload.submission_id)
-        if isinstance(exc, RuntimeError) and "needs_review_jobs" in str(exc):
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database schema missing needs_review_jobs table") from exc
+        logger.exception(
+            "Callback primary persistence failed event_id=%s job_id=%s submission_id=%s primary_commit_status=failed exception=%s message=%s",
+            event_id,
+            payload.job_id,
+            payload.submission_id,
+            exc.__class__.__name__,
+            _clean_error_text(exc),
+        )
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to persist agent callback") from exc
 
     await db.refresh(submission)
+
+    side_effects: dict[str, str] = {}
+    if submission.status == SubmissionStatus.quarantined:
+        side_effects["needs_review_job"] = await _persist_needs_review_side_effect(
+            db=db,
+            payload=payload,
+            submission=submission,
+            event_id=event_id,
+            settings=settings,
+        )
+        logger.info(
+            "Callback side effect completed event_id=%s job_id=%s submission_id=%s side_effect_type=needs_review_job side_effect_status=%s",
+            event_id,
+            payload.job_id,
+            submission.id,
+            side_effects["needs_review_job"],
+        )
+    elif submission.status in {SubmissionStatus.failed, SubmissionStatus.callback_failed}:
+        side_effects["dead_letter_job"] = await _persist_dead_letter_side_effect(
+            db=db,
+            payload=payload,
+            submission=submission,
+            event_id=event_id,
+        )
+        logger.info(
+            "Callback side effect completed event_id=%s job_id=%s submission_id=%s side_effect_type=dead_letter_job side_effect_status=%s",
+            event_id,
+            payload.job_id,
+            submission.id,
+            side_effects["dead_letter_job"],
+        )
 
     ws_payload = {
         "upload_id": str(submission.id),
@@ -345,4 +579,11 @@ async def agent_callback(
     await ws_manager.broadcast("uploads", "upload_status", ws_payload)
     await ws_manager.broadcast("dashboard", "dashboard_refresh", ws_payload)
 
-    return {"message": "Callback accepted", **ws_payload}
+    return {
+        "message": "Callback accepted",
+        "accepted": True,
+        "primary_state_persisted": True,
+        "idempotent_replay": False,
+        "side_effects": side_effects,
+        **ws_payload,
+    }

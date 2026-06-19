@@ -34,7 +34,8 @@ class CalculationAgent:
                                 "sum", "mean", "median", "min", "max", "count",
                                 "count_distinct", "variance", "standard_deviation",
                                 "group_sum", "group_mean", "group_count",
-                                "running_total", "percentage_change", "difference", "ratio"
+                                "running_total", "percentage_change", "difference", "ratio",
+                                "absolute_value"
                             ]
                         },
                         "column": {"type": "string"},
