@@ -9,9 +9,13 @@ def _check_numeric(s: pd.Series, operator: str):
         raise OperationExecutionError(f"Operator {operator} requires numeric or datetime column, got {s.dtype}")
 
 def filter_eq(s: pd.Series, cond: FilterCondition) -> pd.Series:
+    if _is_text_series(s) and isinstance(cond.value, str) and not cond.case_sensitive:
+        return s.astype(str).str.lower().str.strip() == cond.value.lower().strip()
     return s == cond.value
 
 def filter_neq(s: pd.Series, cond: FilterCondition) -> pd.Series:
+    if _is_text_series(s) and isinstance(cond.value, str) and not cond.case_sensitive:
+        return s.astype(str).str.lower().str.strip() != cond.value.lower().strip()
     return s != cond.value
 
 def filter_gt(s: pd.Series, cond: FilterCondition) -> pd.Series:
