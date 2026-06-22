@@ -46,7 +46,7 @@ def test_replace_column_mapping_creates_revision_and_resumes(monkeypatch):
             user_id=uuid4(),
             version_number=1,
             status=SubmissionStatus.awaiting_confirmation,
-            summary={"canonical_intent": canonical_intent, "schema_proposal": {"canonical_intent": canonical_intent}},
+            summary={"canonical_intent": canonical_intent},
         )
 
         fake_db = FakeDbSession(submission)
@@ -99,7 +99,7 @@ def test_reject_interpretation_pauses_without_resuming(monkeypatch):
             user_id=uuid4(),
             version_number=1,
             status=SubmissionStatus.awaiting_confirmation,
-            summary={"canonical_intent": canonical_intent, "schema_proposal": {"canonical_intent": canonical_intent}},
+            summary={"canonical_intent": canonical_intent},
         )
 
         fake_db = FakeDbSession(submission)
@@ -124,7 +124,7 @@ def test_reject_interpretation_pauses_without_resuming(monkeypatch):
 
     submission = asyncio.run(run())
 
-    assert submission.status == SubmissionStatus.awaiting_confirmation
+    assert submission.status == SubmissionStatus.awaiting_clarification
     assert submission.summary["review_status"] == "rejected"
     assert submission.summary["canonical_intent_status"] == "rejected"
 
@@ -143,7 +143,7 @@ def test_resume_job_enqueues_existing_canonical_intent(monkeypatch):
             user_id=uuid4(),
             version_number=1,
             status=SubmissionStatus.awaiting_confirmation,
-            summary={"canonical_intent": canonical_intent, "schema_proposal": {"canonical_intent": canonical_intent}},
+            summary={"canonical_intent": canonical_intent},
         )
         fake_db = FakeDbSession(submission)
         enqueue_calls: list[tuple[str, str, bool]] = []

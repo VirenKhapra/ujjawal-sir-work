@@ -298,3 +298,84 @@ def test_agent_callback_persistence_failure_surfaces_context(monkeypatch):
         assert "database write blocked" in exc.value.detail
 
     asyncio.run(run())
+
+
+def test_agent_callback_preserves_data_profile_and_canonical_summary_keys(monkeypatch):
+    async def run() -> None:
+        submission = _build_submission()
+        submission.summary = {
+            "data_profile": {"source_columns": ["amount"]},
+            "canonical_intent": {"actions": [{"kind": "clean"}]},
+            "existing_metadata": {"trace": "abc"},
+        }
+        fake_db = FakeCallbackDb(submission, table_exists=True)
+        settings = type(
+            "Settings",
+            (),
+            {
+                "agent_callback_secret": "test-secret",
+                "enable_needs_review_jobs": True,
+            },
+        )()
+
+        monkeypatch.setattr("app.api.agent.get_settings", lambda: settings)
+        monkeypatch.setattr("app.api.agent.inspect", lambda _connection: FakeInspector(True))
+        monkeypatch.setattr("app.api.agent.ws_manager.broadcast", lambda *args, **kwargs: asyncio.sleep(0))
+
+        payload = AgentCallbackPayload(
+            submission_id=str(submission.id),
+            status="complete",
+            summary={"execution_result": {"status": "ok"}},
+        )
+
+        response = await agent_callback(payload, DummyRequest({"Authorization": "Bearer test-secret"}), fake_db)
+
+        assert response["primary_state_persisted"] is True
+        assert submission.summary["data_profile"] == {"source_columns": ["amount"]}
+        assert submission.summary["canonical_intent"] == {"actions": [{"kind": "clean"}]}
+        assert submission.summary["existing_metadata"] == {"trace": "abc"}
+        assert submission.summary["execution_result"] == {"status": "ok"}
+
+    asyncio.run(run())
+
+
+def test_agent_callback_ignores_protected_profile_and_intent_overwrites(monkeypatch):
+    async def run() -> None:
+        submission = _build_submission()
+        submission.summary = {
+            "data_profile": {"source_columns": ["amount"]},
+            "profile_status": "ready",
+            "canonical_intent": {"actions": [{"kind": "clean"}]},
+        }
+        fake_db = FakeCallbackDb(submission, table_exists=True)
+        settings = type(
+            "Settings",
+            (),
+            {
+                "agent_callback_secret": "test-secret",
+                "enable_needs_review_jobs": True,
+            },
+        )()
+
+        monkeypatch.setattr("app.api.agent.get_settings", lambda: settings)
+        monkeypatch.setattr("app.api.agent.inspect", lambda _connection: FakeInspector(True))
+        monkeypatch.setattr("app.api.agent.ws_manager.broadcast", lambda *args, **kwargs: asyncio.sleep(0))
+
+        payload = AgentCallbackPayload(
+            submission_id=str(submission.id),
+            status="complete",
+            summary={
+                "data_profile": {"source_columns": ["tampered"]},
+                "canonical_intent": {"actions": [{"kind": "drop_columns"}]},
+                "execution_result": {"status": "ok"},
+            },
+        )
+
+        await agent_callback(payload, DummyRequest({"Authorization": "Bearer test-secret"}), fake_db)
+
+        assert submission.summary["data_profile"] == {"source_columns": ["amount"]}
+        assert submission.summary["profile_status"] == "ready"
+        assert submission.summary["canonical_intent"] == {"actions": [{"kind": "clean"}]}
+        assert submission.summary["execution_result"] == {"status": "ok"}
+
+    asyncio.run(run())

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field as dc_field
 import hashlib
 import difflib
 import json
@@ -10,7 +11,8 @@ from typing import Any, Annotated, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.services.semantic_schema import infer_column_roles, normalize_semantic_name
+from app.services.llm_telemetry import log_runtime_event
+from app.services.semantic_schema import canonical_target_for_column, infer_column_roles, normalize_semantic_name
 
 
 CANONICAL_INTENT_SCHEMA_VERSION = "2.0"
@@ -46,8 +48,22 @@ class FilterCondition(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     field: UnresolvedColumnReference
-    operator: Literal["eq", "neq", "gt", "lt", "gte", "lte", "contains"]
+    operator: Literal["eq", "neq", "gt", "lt", "gte", "lte", "contains", "in", "not_in"]
     value: Any
+
+
+@dataclass(slots=True)
+class _FilterFieldGroundingCandidate:
+    column: str
+    exact_value_matches: int = 0
+    requested_value_count: int = 0
+    value_coverage: float = 0.0
+    observed_value_matches: list[str] = dc_field(default_factory=list)
+    semantic_role_score: float = 0.0
+    column_name_similarity: float = 0.0
+    type_compatibility_score: float = 0.0
+    final_score: float = 0.0
+    resolution_reason: str = "insufficient_evidence"
 
 
 class ProjectColumnsIntent(BaseModel):
@@ -256,7 +272,7 @@ _SUPPORTED_ACTION_KINDS = {
     "visualize",
     "report",
 }
-_SUPPORTED_OPERATORS = {"eq", "neq", "gt", "lt", "gte", "lte", "contains"}
+_SUPPORTED_OPERATORS = {"eq", "neq", "gt", "lt", "gte", "lte", "contains", "in", "not_in"}
 _SUPPORTED_OUTPUT_FORMATS = {"xlsx", "csv", "json", "txt"}
 
 
@@ -312,8 +328,11 @@ def _try_semantic_extraction(
     source_columns: list[str],
     *,
     preview_rows: list[dict[str, Any]] | None = None,
+    data_profile: dict[str, Any] | None = None,
     output_format: str = "xlsx",
     detected_types: dict[str, str] | None = None,
+    submission_id: str = "",
+    trigger: str = "upload",
 ) -> dict[str, Any] | None:
     """Try the hybrid semantic extraction pipeline.
 
@@ -333,6 +352,22 @@ def _try_semantic_extraction(
     if not instruction or not instruction.strip():
         return None
 
+    log_runtime_event(
+        "canonical_extractor_entered",
+        service="backend",
+        trigger=trigger,
+        submission_id=submission_id,
+        http_method="POST" if trigger == "upload" else "",
+        instruction_present=True,
+        canonical_intent_present=False,
+        legacy_schema_state_present=False,
+        prompt_text=instruction,
+        source_column_count=len(source_columns),
+        preview_row_count=len(preview_rows or []),
+        output_format=output_format,
+        bridge_enabled=bool(os.environ.get("GROQ_BRIDGE_API_KEY", "") or os.environ.get("GROQ_API_KEY", "")),
+    )
+
     try:
         # ---- Try the NEW semantic pipeline (finflow_agent) first ----
         from app.services.new_pipeline_bridge import run_new_semantic_pipeline_sync
@@ -342,10 +377,18 @@ def _try_semantic_extraction(
             source_columns,
             column_types=detected_types,
             output_format=output_format,
+            submission_id=submission_id,
+            trigger=trigger,
         )
         if new_result is not None:
-            dataframe_profile = _build_dataframe_profile(source_columns, preview_rows or [], detected_types or {})
-            new_result = _repair_profile_grounded_references(new_result, dataframe_profile)
+            dataframe_profile = _build_dataframe_profile(
+                source_columns,
+                preview_rows or [],
+                detected_types or {},
+                data_profile=data_profile,
+            )
+            new_result = _repair_select_all_projection(new_result, instruction=instruction, source_columns=source_columns)
+            new_result = _repair_profile_grounded_references(new_result, dataframe_profile, submission_id=submission_id)
             logger.info("New pipeline extraction succeeded for: %s", instruction[:80])
             return new_result
 
@@ -479,7 +522,7 @@ def _dict_conditions_to_typed(
         if not field_ref:
             continue
         operator = str(cond.get("operator", "eq")).strip()
-        if operator not in {"eq", "neq", "gt", "lt", "gte", "lte", "contains"}:
+        if operator not in {"eq", "neq", "gt", "lt", "gte", "lte", "contains", "in", "not_in"}:
             operator = "eq"
         result.append(FilterCondition(
             field=field_ref,
@@ -496,7 +539,10 @@ def build_canonical_intent(
     *,
     output_format: str = "xlsx",
     detected_types: dict[str, str] | None = None,
+    data_profile: dict[str, Any] | None = None,
     capability_snapshot: CapabilitySnapshot | dict[str, Any] | None = None,
+    submission_id: str = "",
+    trigger: str = "upload",
 ) -> dict[str, Any]:
     # ---------------------------------------------------------------
     # HYBRID SEMANTIC PIPELINE: Try semantic extraction first.
@@ -504,12 +550,29 @@ def build_canonical_intent(
     # or if GROQ_API_KEY is not configured.
     # ---------------------------------------------------------------
     source_columns = [str(column) for column in source_columns if str(column).strip()]
+    log_runtime_event(
+        "canonical_compiler_entered",
+        service="backend",
+        trigger=trigger,
+        submission_id=submission_id,
+        http_method="POST" if trigger == "upload" else "",
+        instruction_present=bool((instruction or "").strip()),
+        canonical_intent_present=False,
+        legacy_schema_state_present=False,
+        prompt_text=instruction or "",
+        source_column_count=len(source_columns),
+        preview_row_count=len(preview_rows or []),
+        detected_type_count=len(detected_types or {}),
+    )
     semantic_result = _try_semantic_extraction(
         instruction,
         source_columns,
         preview_rows=preview_rows,
+        data_profile=data_profile,
         output_format=output_format,
         detected_types=detected_types,
+        submission_id=submission_id,
+        trigger=trigger,
     )
     if semantic_result is not None:
         return semantic_result
@@ -519,7 +582,12 @@ def build_canonical_intent(
     # ---------------------------------------------------------------
     normalized_prompt = _normalize_text(instruction)
     source_columns = [str(column) for column in source_columns if str(column).strip()]
-    dataframe_profile = _build_dataframe_profile(source_columns, preview_rows, detected_types or {})
+    dataframe_profile = _build_dataframe_profile(
+        source_columns,
+        preview_rows,
+        detected_types or {},
+        data_profile=data_profile,
+    )
     role_columns = infer_column_roles(source_columns)
     capability_snapshot_model = (
         capability_snapshot
@@ -614,12 +682,13 @@ def build_canonical_intent(
         not item.get("resolved_column") and not item.get("resolved_columns")
         for item in grounded_references
     )
+    has_ambiguous_references = any(str(item.get("selection_mode", "")).strip() == "ambiguous" for item in grounded_references)
 
     if not actions:
         resolution_status: RESOLUTION_STATUS = "needs_clarification" if normalized_prompt else "unsupported"
-    elif has_unresolved_references:
+    elif has_unresolved_references or has_ambiguous_references:
         resolution_status = "needs_clarification"
-        evidence.append("One or more requested fields could not be grounded to available columns.")
+        evidence.append("One or more requested fields could not be grounded decisively to available columns.")
     elif repair_notes:
         resolution_status = "repaired"
     elif any(item.get("resolution_method") not in {None, "exact_name"} for item in grounded_references):
@@ -650,7 +719,11 @@ def build_canonical_intent(
         grounded_at=datetime.now(UTC),
     )
     canonical.intent_hash = compute_intent_hash(canonical)
-    return _repair_profile_grounded_references(canonical.model_dump(mode="json"), dataframe_profile)
+    return _repair_profile_grounded_references(
+        canonical.model_dump(mode="json"),
+        dataframe_profile,
+        submission_id=submission_id,
+    )
 
 
 def canonical_intent_to_legacy_action_schema(canonical_intent: dict[str, Any]) -> dict[str, Any]:
@@ -814,6 +887,24 @@ def _extract_projection_action(
         return None, [], [], []
     if _looks_like_filter_request(normalized_prompt):
         return None, [], [], []
+    if any(re.search(pattern, normalized_prompt) for pattern in _SELECT_ALL_PATTERNS):
+        return (
+            ProjectColumnsIntent(
+                kind="project_columns",
+                requested_fields=[
+                    UnresolvedColumnReference(
+                        raw_reference="all columns",
+                        resolved_columns=[str(column) for column in source_columns if str(column).strip()],
+                        candidate_columns=[str(column) for column in source_columns if str(column).strip()],
+                        selection_mode="semantic_family",
+                        resolution_method="all_columns",
+                    )
+                ],
+            ),
+            ["The instruction explicitly requests that every column be preserved in the output."],
+            [],
+            [],
+        )
 
     references = _extract_requested_columns(normalized_prompt, source_columns, role_columns, dataframe_profile)
     if not references:
@@ -871,6 +962,15 @@ def _extract_filter_rows_action(
     if not _looks_like_filter_request(normalized_prompt):
         return None, [], [], []
 
+    membership_filter, membership_evidence, membership_assumptions, membership_notes = _extract_membership_filter_action(
+        normalized_prompt,
+        source_columns,
+        role_columns,
+        dataframe_profile,
+    )
+    if membership_filter is not None:
+        return membership_filter, membership_evidence, membership_assumptions, membership_notes
+
     clauses, connectors = _split_filter_clauses(_strip_filter_prefix(normalized_prompt))
     if not clauses:
         return None, [], [], []
@@ -899,6 +999,51 @@ def _extract_filter_rows_action(
         assumptions,
         notes,
     )
+
+
+def _extract_membership_filter_action(
+    normalized_prompt: str,
+    source_columns: list[str],
+    role_columns: dict[str, list[str]],
+    dataframe_profile: dict[str, Any],
+) -> tuple[FilterRowsIntent | None, list[str], list[str], list[str]]:
+    prompt = _strip_noise_tokens(_strip_filter_prefix(normalized_prompt))
+    if not prompt:
+        return None, [], [], []
+
+    patterns = (
+        r"(?P<op>contains?|with)\s+(?P<values>.+?)\s+as\s+(?:a\s+)?(?P<field>.+)",
+        r"(?P<field>.+?)\s+(?:is|equals?|equal to|=|:)\s*(?P<values>.+)",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, prompt, flags=re.IGNORECASE)
+        if not match:
+            continue
+        field_text = match.groupdict().get("field", "")
+        values_text = match.groupdict().get("values", "")
+        if not field_text or not values_text:
+            continue
+        value = _coerce_filter_value(values_text)
+        if not isinstance(value, list) or len(value) <= 1:
+            continue
+        field_ref = _ground_column_reference(field_text, source_columns, role_columns)
+        if field_ref is None:
+            continue
+        condition = FilterCondition(field=field_ref, operator="in", value=value)
+        evidence = ["The instruction constrains rows with a membership-style value list."]
+        notes = []
+        assumptions = []
+        if condition.field.resolution_method not in {None, "exact_name"}:
+            notes.append("Resolved one or more filter fields through schema grounding.")
+        return (
+            FilterRowsIntent(kind="filter_rows", mode="drop" if _looks_like_drop_row_request(normalized_prompt) else "keep", conditions=[condition], logic="and"),
+            evidence,
+            assumptions,
+            notes,
+        )
+
+    return None, [], [], []
 
 
 def _extract_sort_action(
@@ -958,6 +1103,8 @@ def _extract_report_action(normalized_prompt: str) -> ReportIntent | None:
 
 
 def _looks_like_projection_request(normalized_prompt: str) -> bool:
+    if any(re.search(pattern, normalized_prompt) for pattern in _SELECT_ALL_PATTERNS):
+        return True
     if not _OUTPUT_RESTRICTION_RE.search(normalized_prompt):
         return False
     return not _looks_like_filter_request(normalized_prompt)
@@ -989,6 +1136,8 @@ def _build_dataframe_profile(
     source_columns: list[str],
     preview_rows: list[dict[str, Any]],
     detected_types: dict[str, str],
+    *,
+    data_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     semantic_roles = infer_column_roles(source_columns)
     preview_samples: dict[str, list[Any]] = {}
@@ -1000,13 +1149,115 @@ def _build_dataframe_profile(
             if len(values) >= 3:
                 break
         preview_samples[column] = values
-    return {
+
+    profile_columns: dict[str, dict[str, Any]] = {}
+    if isinstance(data_profile, dict):
+        for column in data_profile.get("columns", []):
+            if not isinstance(column, dict):
+                continue
+            name = str(column.get("name", "")).strip()
+            if name:
+                profile_columns[name] = column
+        if not preview_rows and isinstance(data_profile.get("preview_rows"), list):
+            preview_rows = [row for row in data_profile.get("preview_rows", []) if isinstance(row, dict)]
+            for column in source_columns:
+                values: list[Any] = []
+                for row in preview_rows[:5]:
+                    if isinstance(row, dict) and column in row and row[column] not in {None, ""}:
+                        values.append(row[column])
+                    if len(values) >= 3:
+                        break
+                preview_samples[column] = values
+
+    merged_columns: list[dict[str, Any]] = []
+    for column in source_columns:
+        column_profile = dict(profile_columns.get(column, {}))
+        column_profile.setdefault("name", column)
+        column_profile.setdefault("normalized_name", normalize_semantic_name(column))
+        column_profile.setdefault("semantic_type_hint", canonical_target_for_column(column))
+        column_profile.setdefault("sample_values", preview_samples.get(column, []))
+        column_profile.setdefault("distinct_count", len(preview_samples.get(column, [])))
+        merged_columns.append(column_profile)
+
+    merged_profile = {
         "source_columns": source_columns,
         "normalized_columns": {column: normalize_semantic_name(column) for column in source_columns},
         "detected_types": {str(key): str(value) for key, value in detected_types.items()},
         "semantic_roles": semantic_roles,
         "preview_values": preview_samples,
+        "columns": merged_columns,
     }
+    if isinstance(data_profile, dict):
+        for key in ("file_fingerprint", "profiler_version", "profile_status", "row_count", "preview_row_count"):
+            if key in data_profile:
+                merged_profile[key] = data_profile[key]
+    return merged_profile
+
+
+_SELECT_ALL_PATTERNS = (
+    r"\breturn all columns\b",
+    r"\bkeep all columns\b",
+    r"\binclude every column\b",
+    r"\bpreserve all columns\b",
+    r"\bshow all fields\b",
+    r"\bretain all fields\b",
+    r"\bkeep every field\b",
+)
+
+
+def _repair_select_all_projection(
+    canonical_intent: dict[str, Any],
+    *,
+    instruction: str,
+    source_columns: list[str],
+) -> dict[str, Any]:
+    if not isinstance(canonical_intent, dict):
+        return canonical_intent
+    normalized_instruction = _normalize_text(instruction)
+    if not any(re.search(pattern, normalized_instruction) for pattern in _SELECT_ALL_PATTERNS):
+        return canonical_intent
+
+    actions = canonical_intent.get("actions")
+    if not isinstance(actions, list):
+        return canonical_intent
+
+    repaired = False
+    for action in actions:
+        if not isinstance(action, dict) or str(action.get("kind", "")).strip() != "project_columns":
+            continue
+        fields = action.get("requested_fields")
+        if not isinstance(fields, list):
+            continue
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            raw_reference = _normalize_text(str(field.get("raw_reference", "")))
+            if raw_reference not in {"all", "all columns", "every column", "all fields", "every field", "everything"}:
+                continue
+            field["raw_reference"] = "all columns"
+            field["resolution_method"] = "all_columns"
+            field["selection_mode"] = "semantic_family"
+            field["resolved_column"] = None
+            field["resolved_columns"] = [str(column) for column in source_columns if str(column).strip()]
+            field["candidate_columns"] = [str(column) for column in source_columns if str(column).strip()]
+            repaired = True
+
+    if not repaired:
+        return canonical_intent
+
+    canonical_intent["resolution_status"] = "resolved"
+    evidence = canonical_intent.get("evidence")
+    if not isinstance(evidence, list):
+        evidence = []
+    evidence.append("Recognized an explicit select-all projection request.")
+    canonical_intent["evidence"] = _dedupe_preserve_order(evidence)
+
+    repair_notes = canonical_intent.get("repair_notes")
+    if not isinstance(repair_notes, list):
+        repair_notes = []
+    repair_notes.append("Expanded explicit select-all wording to a deterministic universal projection.")
+    canonical_intent["repair_notes"] = _dedupe_preserve_order(repair_notes)
+    return canonical_intent
 
 
 _GENERIC_FIELD_REFERENCES = {
@@ -1024,6 +1275,7 @@ _GENERIC_FIELD_REFERENCES = {
     "records",
     "which",
     "that",
+    "education",
 }
 
 _PAYMENT_VALUE_HINTS = {
@@ -1060,6 +1312,8 @@ _STATUS_VALUE_HINTS = {
 def _repair_profile_grounded_references(
     canonical_intent: dict[str, Any],
     dataframe_profile: dict[str, Any],
+    *,
+    submission_id: str = "",
 ) -> dict[str, Any]:
     if not isinstance(canonical_intent, dict):
         return canonical_intent
@@ -1090,6 +1344,7 @@ def _repair_profile_grounded_references(
                 operator=str(condition.get("operator", "eq")).strip(),
                 value=condition.get("value"),
                 dataframe_profile=dataframe_profile,
+                submission_id=submission_id,
             )
             if grounded is None:
                 continue
@@ -1100,6 +1355,7 @@ def _repair_profile_grounded_references(
         return canonical_intent
 
     unresolved_after = _count_unresolved_action_references(actions)
+    ambiguous_after = _count_ambiguous_action_references(actions)
     repair_notes = canonical_intent.get("repair_notes")
     if not isinstance(repair_notes, list):
         repair_notes = []
@@ -1115,7 +1371,11 @@ def _repair_profile_grounded_references(
         evidence.append("Profile-aware grounding resolved previously generic filter references.")
         canonical_intent["evidence"] = _dedupe_preserve_order(evidence)
 
-    if unresolved_after == 0 and str(canonical_intent.get("resolution_status", "")).strip() == "needs_clarification":
+    if (
+        unresolved_after == 0
+        and ambiguous_after == 0
+        and str(canonical_intent.get("resolution_status", "")).strip() == "needs_clarification"
+    ):
         canonical_intent["resolution_status"] = "repaired"
 
     return canonical_intent
@@ -1155,12 +1415,47 @@ def _count_unresolved_action_references(actions: list[Any]) -> int:
     return unresolved
 
 
+def _count_ambiguous_action_references(actions: list[Any]) -> int:
+    ambiguous = 0
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        kind = str(action.get("kind", "")).strip()
+        if kind in {"project_columns", "drop_columns"}:
+            for field in action.get("requested_fields", []):
+                if isinstance(field, dict) and str(field.get("selection_mode", "")).strip() == "ambiguous":
+                    ambiguous += 1
+        elif kind == "filter_rows":
+            for condition in action.get("conditions", []):
+                if not isinstance(condition, dict):
+                    continue
+                field = condition.get("field")
+                if isinstance(field, dict) and str(field.get("selection_mode", "")).strip() == "ambiguous":
+                    ambiguous += 1
+        elif kind == "rename_columns":
+            for mapping in action.get("mapping", []):
+                if not isinstance(mapping, dict):
+                    continue
+                source = mapping.get("source")
+                if isinstance(source, dict) and str(source.get("selection_mode", "")).strip() == "ambiguous":
+                    ambiguous += 1
+        elif kind == "sort_rows":
+            for item in action.get("sort_keys", []):
+                if not isinstance(item, dict):
+                    continue
+                column = item.get("column")
+                if isinstance(column, dict) and str(column.get("selection_mode", "")).strip() == "ambiguous":
+                    ambiguous += 1
+    return ambiguous
+
+
 def _ground_filter_field_from_profile(
     *,
     field: dict[str, Any],
     operator: str,
     value: Any,
     dataframe_profile: dict[str, Any],
+    submission_id: str = "",
 ) -> dict[str, Any] | None:
     raw_reference = str(field.get("raw_reference", "")).strip()
     source_columns = [
@@ -1172,7 +1467,6 @@ def _ground_filter_field_from_profile(
         return None
 
     role_columns = dataframe_profile.get("semantic_roles", {})
-    preview_values = dataframe_profile.get("preview_values", {})
     detected_types = {
         str(key): str(val).strip().lower()
         for key, val in (dataframe_profile.get("detected_types") or {}).items()
@@ -1185,39 +1479,33 @@ def _ground_filter_field_from_profile(
     compact_values = {_compact_token(value_string) for value_string in value_strings if _compact_token(value_string)}
     value_concepts = _value_concepts(value_tokens, value_strings)
 
-    scored: list[tuple[float, str, list[str]]] = []
+    scored: list[_FilterFieldGroundingCandidate] = []
     for column in source_columns:
-        score = 0.0
-        evidence: list[str] = []
+        column_profile = _profile_column_metadata(dataframe_profile, column)
+        observed_values = _profile_observed_values(dataframe_profile, column)
+        observed_normalized = {_normalize_reference(item) for item in observed_values if _normalize_reference(item)}
+        observed_compact = {_compact_token(item) for item in observed_values if _compact_token(item)}
+        observed_tokens = _value_tokens(observed_values)
         column_normalized = normalize_semantic_name(column)
-        preview_strings = [str(item) for item in preview_values.get(column, []) if str(item).strip()]
-        preview_tokens = _value_tokens(preview_strings)
-        preview_compact = {_compact_token(item) for item in preview_strings if _compact_token(item)}
+        column_tokens = {token for token in _normalize_reference(column).split() if token}
 
-        if not generic_reference:
-            overlap = requested_tokens & set(column_normalized.replace("_", " ").split())
-            if overlap:
-                score += 0.30
-                evidence.append(f"field_overlap={sorted(overlap)}")
-            semantic_aliases = {
-                _normalize_reference(alias)
-                for alias in _semantic_role_aliases(column_normalized)
-            }
-            alias_overlap = requested_tokens & {token for alias in semantic_aliases for token in alias.split()}
-            if alias_overlap:
-                score += 0.20
-                evidence.append(f"semantic_alias_overlap={sorted(alias_overlap)}")
+        exact_value_matches = 0
+        matched_values: list[str] = []
+        for requested in value_strings:
+            requested_normalized = _normalize_reference(requested)
+            requested_compact = _compact_token(requested)
+            if requested_normalized and requested_normalized in observed_normalized:
+                exact_value_matches += 1
+                matched_values.append(requested)
+                continue
+            if requested_compact and requested_compact in observed_compact:
+                exact_value_matches += 1
+                matched_values.append(requested)
 
-        exact_value_overlap = compact_values & preview_compact
-        if exact_value_overlap:
-            score += 0.55
-            evidence.append(f"value_preview_overlap={sorted(exact_value_overlap)}")
-        elif value_tokens and preview_tokens:
-            token_overlap = value_tokens & preview_tokens
-            if token_overlap:
-                score += 0.20
-                evidence.append(f"value_token_overlap={sorted(token_overlap)}")
+        requested_value_count = len(value_strings)
+        value_coverage = (exact_value_matches / requested_value_count) if requested_value_count else 0.0
 
+        semantic_role_score = 0.0
         column_roles = {
             role
             for role, values in role_columns.items()
@@ -1225,47 +1513,215 @@ def _ground_filter_field_from_profile(
         }
         if "payment" in value_concepts:
             if {"merchant", "payment_value"} & column_roles:
-                score += 0.35
-                evidence.append("payment-like value matches payment-oriented semantic role")
+                semantic_role_score += 0.35
             if "payment" in column_normalized or "method" in column_normalized or "gateway" in column_normalized:
-                score += 0.15
-                evidence.append("column name is payment-oriented")
+                semantic_role_score += 0.20
+            if column_profile.get("semantic_type_hint") in {"payment_method", "merchant", "payment_value"}:
+                semantic_role_score += 0.25
         if "status" in value_concepts:
             if "status" in column_roles or "status" in column_normalized:
-                score += 0.35
-                evidence.append("status-like value matches status-oriented column")
+                semantic_role_score += 0.35
+            if column_profile.get("semantic_type_hint") in {"status", "payment_status"}:
+                semantic_role_score += 0.20
         if "date" in value_concepts:
             if "date" in column_roles or detected_types.get(column) == "date":
-                score += 0.35
-                evidence.append("date-like value matches date-oriented column")
+                semantic_role_score += 0.35
+            if column_profile.get("semantic_type_hint") == "date":
+                semantic_role_score += 0.15
         if "numeric" in value_concepts and detected_types.get(column) == "number":
-            score += 0.20
-            evidence.append("numeric-like value matches numeric column type")
+            semantic_role_score += 0.20
+        if observed_tokens & value_tokens:
+            semantic_role_score += 0.10
 
-        if operator == "contains" and detected_types.get(column) == "string":
-            score += 0.05
-            evidence.append("contains operator favors string-like columns")
+        column_name_similarity = 0.0
+        if not generic_reference:
+            overlap = requested_tokens & set(column_normalized.replace("_", " ").split())
+            if overlap:
+                column_name_similarity += 0.30
+            semantic_aliases = {
+                _normalize_reference(alias)
+                for alias in _semantic_role_aliases(column_normalized)
+            }
+            alias_overlap = requested_tokens & {token for alias in semantic_aliases for token in alias.split()}
+            if alias_overlap:
+                column_name_similarity += 0.20
+        elif value_coverage > 0:
+            # Generic field references should only auto-resolve on value evidence
+            # or strong semantic role evidence, not on fuzzy name matching alone.
+            column_name_similarity += 0.05 if column_tokens else 0.0
 
-        scored.append((score, column, evidence))
+        type_compatibility_score = 0.0
+        detected_type = detected_types.get(column, "")
+        if requested_value_count:
+            if "payment" in value_concepts and detected_type in {"string", "object", "category", ""}:
+                type_compatibility_score += 0.10
+            if "status" in value_concepts and detected_type in {"string", "object", "category", ""}:
+                type_compatibility_score += 0.10
+            if "date" in value_concepts and detected_type in {"date", "datetime", "string", "object", ""}:
+                type_compatibility_score += 0.10
+            if "numeric" in value_concepts and detected_type == "number":
+                type_compatibility_score += 0.10
 
-    scored.sort(key=lambda item: item[0], reverse=True)
+        final_score = 0.0
+        if requested_value_count:
+            final_score += min(0.70, value_coverage * 0.70)
+        final_score += semantic_role_score
+        final_score += column_name_similarity
+        final_score += type_compatibility_score
+        if operator == "contains" and detected_type in {"string", "object", "category", ""}:
+            final_score += 0.05
+        if operator in {"in", "not_in"}:
+            final_score += 0.05
+
+        resolution_reason = "insufficient_evidence"
+        if exact_value_matches and value_coverage >= 1.0:
+            resolution_reason = "observed_value_unique_match"
+        elif exact_value_matches:
+            resolution_reason = "observed_value_match"
+        elif semantic_role_score >= 0.35:
+            resolution_reason = "semantic_role_match"
+        elif column_name_similarity >= 0.30:
+            resolution_reason = "column_name_match"
+
+        scored.append(
+            _FilterFieldGroundingCandidate(
+                column=column,
+                exact_value_matches=exact_value_matches,
+                requested_value_count=requested_value_count,
+                value_coverage=value_coverage,
+                observed_value_matches=matched_values,
+                semantic_role_score=semantic_role_score,
+                column_name_similarity=column_name_similarity,
+                type_compatibility_score=type_compatibility_score,
+                final_score=final_score,
+                resolution_reason=resolution_reason,
+            )
+        )
+
+    scored.sort(key=lambda item: (item.final_score, item.exact_value_matches, item.value_coverage), reverse=True)
     if not scored:
         return None
 
-    best_score, best_column, best_evidence = scored[0]
-    second_score = scored[1][0] if len(scored) > 1 else 0.0
-    if best_score < 0.55 or (best_score - second_score) < 0.15:
+    best = scored[0]
+    second = scored[1] if len(scored) > 1 else None
+
+    decisive_value_match = (
+        best.requested_value_count > 0
+        and best.exact_value_matches > 0
+        and best.value_coverage >= 0.5
+        and best.final_score >= 0.45
+        and (second is None or best.exact_value_matches > second.exact_value_matches or (best.final_score - second.final_score) >= 0.10)
+    )
+    decisive_semantic_match = (
+        best.requested_value_count == 0
+        and best.final_score >= 0.60
+        and (second is None or (best.final_score - second.final_score) >= 0.15)
+    )
+
+    if decisive_value_match or decisive_semantic_match:
+        try:
+            log_runtime_event(
+                "profile_grounding_decision",
+                service="backend",
+                submission_id=submission_id,
+                operator=operator,
+                candidate_count=len(scored),
+                requested_value_count=best.requested_value_count,
+                exact_value_matches=best.exact_value_matches,
+                value_coverage=round(best.value_coverage, 3),
+                best_score=round(best.final_score, 3),
+                second_score=round(second.final_score, 3) if second else 0.0,
+                resolution_reason=best.resolution_reason,
+                generic_reference=generic_reference,
+            )
+        except Exception:
+            pass
+        return {
+            **field,
+            "resolved_column": best.column,
+            "resolved_columns": [best.column],
+            "candidate_columns": [candidate.column for candidate in scored[:3]],
+            "selection_mode": "single",
+            "resolution_method": "profile_value_evidence" if decisive_value_match else "profile_semantic_match",
+            "evidence": _dedupe_preserve_order(
+                list(field.get("evidence", []))
+                + [
+                    f"profile_match={best.resolution_reason}",
+                    f"candidate_count={len(scored)}",
+                ]
+            ),
+        }
+
+    try:
+        log_runtime_event(
+            "profile_grounding_decision",
+            service="backend",
+            submission_id=submission_id,
+            operator=operator,
+            candidate_count=len(scored),
+            requested_value_count=best.requested_value_count,
+            exact_value_matches=best.exact_value_matches,
+            value_coverage=round(best.value_coverage, 3),
+            best_score=round(best.final_score, 3),
+            second_score=round(second.final_score, 3) if second else 0.0,
+            resolution_reason="ambiguous",
+            generic_reference=generic_reference,
+        )
+    except Exception:
+        pass
+
+    if best.final_score < 0.45 or not decisive_value_match and (best.final_score - (second.final_score if second else 0.0)) < 0.10:
         return None
 
     return {
         **field,
-        "resolved_column": best_column,
-        "resolved_columns": [best_column],
-        "candidate_columns": [column for _score, column, _evidence in scored[:3]],
+        "resolved_column": best.column,
+        "resolved_columns": [best.column],
+        "candidate_columns": [candidate.column for candidate in scored[:3]],
         "selection_mode": "single",
         "resolution_method": "profile_semantic_match",
-        "evidence": _dedupe_preserve_order(list(field.get("evidence", [])) + best_evidence),
+        "evidence": _dedupe_preserve_order(
+            list(field.get("evidence", []))
+            + [f"profile_match={best.resolution_reason}", f"candidate_count={len(scored)}"]
+        ),
     }
+
+
+def _profile_column_metadata(dataframe_profile: dict[str, Any], column: str) -> dict[str, Any]:
+    for item in dataframe_profile.get("columns", []):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("name", "")).strip() == column:
+            return item
+    return {}
+
+
+def _profile_observed_values(dataframe_profile: dict[str, Any], column: str) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+
+    def _append(raw: Any) -> None:
+        text = str(raw).strip()
+        if not text:
+            return
+        marker = _compact_token(text) or text.lower()
+        if marker in seen:
+            return
+        seen.add(marker)
+        values.append(text)
+
+    preview_values = dataframe_profile.get("preview_values", {})
+    if isinstance(preview_values, dict):
+        for item in preview_values.get(column, []):
+            _append(item)
+
+    column_profile = _profile_column_metadata(dataframe_profile, column)
+    sample_values = column_profile.get("sample_values", [])
+    if isinstance(sample_values, list):
+        for item in sample_values:
+            _append(item)
+
+    return values
 
 
 def _flatten_filter_values(value: Any) -> list[str]:
@@ -1374,7 +1830,8 @@ def _iter_column_reference_candidates(
         for alias in _ROLE_ALIASES.get(role, {role}):
             if not _phrase_in_prompt(alias, normalized_prompt):
                 continue
-            for column in values:
+            if len(values) == 1:
+                column = values[0]
                 if column in seen:
                     continue
                 seen.add(column)
@@ -1383,6 +1840,22 @@ def _iter_column_reference_candidates(
                         raw_reference=alias,
                         resolved_column=column,
                         resolution_method="semantic_role",
+                        selection_mode="single",
+                    )
+                )
+            elif len(values) > 1:
+                candidate_columns = [column for column in values if column not in seen]
+                if not candidate_columns:
+                    continue
+                seen.update(candidate_columns)
+                candidates.append(
+                    UnresolvedColumnReference(
+                        raw_reference=alias,
+                        resolution_method="semantic_role",
+                        selection_mode="ambiguous",
+                        resolved_columns=candidate_columns,
+                        candidate_columns=candidate_columns,
+                        evidence=[f"Semantic role {role!r} matches multiple columns."],
                     )
                 )
 
@@ -1408,15 +1881,18 @@ def _parse_filter_clause(
         field_ref = _ground_column_reference(contains_value_first.group("field"), source_columns, role_columns)
         if field_ref is None:
             return None
-        return FilterCondition(field=field_ref, operator="contains", value=_coerce_value(contains_value_first.group("value")))
+        value = _coerce_filter_value(contains_value_first.group("value"))
+        operator = "in" if isinstance(value, list) and len(value) > 1 else "contains"
+        return FilterCondition(field=field_ref, operator=operator, value=value)
 
     value_first = re.match(r"^(?P<value>.+?)\s+as\s+(?:a\s+)?(?P<field>.+)$", clause, flags=re.IGNORECASE)
     if value_first:
         field_ref = _ground_column_reference(value_first.group("field"), source_columns, role_columns)
         if field_ref is None:
             return None
-        value = _coerce_value(value_first.group("value"))
-        return FilterCondition(field=field_ref, operator="eq", value=value)
+        value = _coerce_filter_value(value_first.group("value"))
+        operator = "in" if isinstance(value, list) and len(value) > 1 else "eq"
+        return FilterCondition(field=field_ref, operator=operator, value=value)
 
     for pattern, operator in (
         (r"^(?P<field>.+?)\s+(?:is|equals?|equal to|=|:)\s*(?P<value>.+)$", "eq"),
@@ -1433,7 +1909,9 @@ def _parse_filter_clause(
         field_ref = _ground_column_reference(match.group("field"), source_columns, role_columns)
         if field_ref is None:
             continue
-        value = _coerce_value(match.group("value"))
+        value = _coerce_filter_value(match.group("value"))
+        if isinstance(value, list) and len(value) > 1 and operator in {"eq", "contains"}:
+            operator = "in"
         return FilterCondition(field=field_ref, operator=operator, value=value)
 
     # Bare "customer id 1002" or "status pending" style clauses.
@@ -1450,7 +1928,9 @@ def _parse_filter_clause(
         if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", remainder):
             return FilterCondition(field=column, operator="eq", value=_coerce_value(remainder))
         if remainder:
-            return FilterCondition(field=column, operator="contains", value=_coerce_value(remainder))
+            value = _coerce_filter_value(remainder)
+            operator = "in" if isinstance(value, list) and len(value) > 1 else "contains"
+            return FilterCondition(field=column, operator=operator, value=value)
     return None
 
 
@@ -1467,6 +1947,8 @@ def _ground_column_reference(
 
     alias_index = aliases or _build_column_alias_index(source_columns)
     normalized_reference = _normalize_reference(raw_reference)
+    generic_reference = not normalized_reference or set(normalized_reference.split()) <= _GENERIC_FIELD_REFERENCES
+    family_columns = _projection_family_columns(raw_reference, source_columns)
 
     exact_matches = alias_index.get(normalized_reference, [])
     if exact_matches:
@@ -1487,8 +1969,27 @@ def _ground_column_reference(
             selection_mode="single",
         )
 
+    if generic_reference and len(family_columns) > 1:
+        return UnresolvedColumnReference(
+            raw_reference=raw_reference,
+            resolution_method="semantic_family",
+            selection_mode="ambiguous",
+            resolved_columns=family_columns,
+            candidate_columns=family_columns,
+            evidence=[f"Generic reference {raw_reference!r} overlaps multiple semantic family columns."],
+        )
+
     best_column, score = _best_column_match(normalized_reference, source_columns)
     if best_column and score >= 0.72:
+        if generic_reference and len(family_columns) > 1 and best_column in family_columns:
+            return UnresolvedColumnReference(
+                raw_reference=raw_reference,
+                resolution_method="semantic_family",
+                selection_mode="ambiguous",
+                resolved_columns=family_columns,
+                candidate_columns=family_columns,
+                evidence=[f"Generic reference {raw_reference!r} is ambiguous across semantic family columns."],
+            )
         method = "normalized_semantic_match" if score >= 0.9 else "fuzzy_match"
         return UnresolvedColumnReference(
             raw_reference=raw_reference,
@@ -1540,7 +2041,7 @@ def _ground_via_roles(normalized_reference: str, role_columns: dict[str, list[st
     for role, aliases in _ROLE_ALIASES.items():
         if reference_phrases & {_normalize_reference(alias) for alias in aliases}:
             columns = role_columns.get(role)
-            if columns:
+            if columns and len(columns) == 1:
                 return columns[0], role
     return None
 
@@ -1847,6 +2348,35 @@ def _coerce_value(value: str) -> Any:
         except ValueError:
             return cleaned
     return cleaned
+
+
+def _coerce_filter_value(value: Any) -> Any:
+    if isinstance(value, list):
+        flattened: list[Any] = []
+        for item in value:
+            coerced = _coerce_filter_value(item)
+            if isinstance(coerced, list):
+                flattened.extend(coerced)
+            elif coerced not in {None, ""}:
+                flattened.append(coerced)
+        deduped = _dedupe_preserve_order(flattened)
+        return deduped
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    parts = [
+        part.strip()
+        for part in re.split(r"\s+(?:or|and)\s+|[,;]", text, flags=re.IGNORECASE)
+        if part.strip()
+    ]
+    if len(parts) > 1:
+        coerced_parts = [_coerce_value(part) for part in parts]
+        deduped = [item for item in _dedupe_preserve_order(coerced_parts) if item not in {None, ""}]
+        if deduped:
+            return deduped
+    return _coerce_value(text)
 
 
 def _dedupe_references(items: list[UnresolvedColumnReference]) -> list[UnresolvedColumnReference]:

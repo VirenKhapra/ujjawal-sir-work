@@ -34,6 +34,8 @@ from typing import Any
 import httpx
 from groq import Groq
 
+from finflow_agent.llm_telemetry import get_runtime_context, log_runtime_event
+
 _GROQ_HTTP_CLIENT: httpx.Client | None = None
 
 
@@ -232,6 +234,35 @@ _FORBIDDEN_PAYLOAD_KEYS: frozenset[str] = frozenset(
 DEFAULT_GROQ_MODEL: str = "llama-3.3-70b-versatile"
 
 
+def _enforce_canonical_legacy_guard() -> None:
+    runtime = get_runtime_context()
+    log_runtime_event(
+        "legacy_planner_entered",
+        service="agent-service",
+        trigger=str(runtime.get("trigger", "worker")),
+        instruction_present=bool(runtime.get("instruction_present")),
+        canonical_intent_present=bool(runtime.get("canonical_intent_present")),
+        legacy_schema_state_present=bool(runtime.get("legacy_schema_state_present")),
+        model=DEFAULT_GROQ_MODEL,
+    )
+    if not runtime.get("canonical_intent_present"):
+        return
+
+    log_runtime_event(
+        "architecture_violation_canonical_job_entered_legacy_planner",
+        service="agent-service",
+        trigger=str(runtime.get("trigger", "worker")),
+        instruction_present=bool(runtime.get("instruction_present")),
+        canonical_intent_present=True,
+        legacy_schema_state_present=bool(runtime.get("legacy_schema_state_present")),
+        model=DEFAULT_GROQ_MODEL,
+    )
+    if os.environ.get("FAIL_ON_CANONICAL_LEGACY_PLANNER", "").strip().lower() in {"1", "true", "yes", "on"}:
+        raise RuntimeError(
+            "Architecture violation: canonical job entered legacy raw-prompt planner"
+        )
+
+
 def assert_no_eval_strings(messages: Any) -> None:
     """Verify *messages* is a plain list of ``{"role", "content"}`` dicts
     whose ``content`` values are strings.
@@ -305,6 +336,7 @@ def call_groq_json(messages: list, schema: dict) -> dict:
     #    LangChain's ``BaseMessage.type`` emits ``human``/``ai`` while Groq
     #    expects ``user``/``assistant``; without this step planning fails
     #    with a 400 on every request that includes a HumanMessage.
+    _enforce_canonical_legacy_guard()
     normalized_messages = normalize_outbound_messages(messages)
 
     # 2. Structural defense-in-depth check on the outbound prompt. Any

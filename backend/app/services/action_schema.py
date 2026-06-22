@@ -65,6 +65,21 @@ def action_schema_to_constraints(action_schema: dict[str, Any]) -> list[dict[str
                             "source": "action_schema",
                         }
                     )
+                elif op in {"in", "one_of"}:
+                    values = _stringify_values(leaf.get("value"))
+                    if not values:
+                        continue
+                    constraints.append(
+                        {
+                            "column": role_name,
+                            "rule": "allowed_values" if action_type == "keep_rows_where" else "not_allowed_values",
+                            "severity": "warning",
+                            "reason": f"Instruction filters on {role_name}.",
+                            "allowed_values": values if action_type == "keep_rows_where" else [],
+                            "not_allowed_values": values if action_type == "drop_rows_where" else [],
+                            "source": "action_schema",
+                        }
+                    )
     return constraints
 
 
@@ -79,3 +94,10 @@ def _iter_leaf_conditions(tree: Any) -> list[dict[str, Any]]:
         elif isinstance(item, dict):
             leaves.append(item)
     return leaves
+
+
+def _stringify_values(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    return [text] if text else []

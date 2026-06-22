@@ -92,7 +92,13 @@ class UploadPreview(BaseModel):
     preferred_agent_name: str | None = None
     job_summary: str | None = None
     agent_summaries: list["JobAgentSummaryRead"] = Field(default_factory=list)
-    schema_proposal: dict = Field(default_factory=dict)
+    data_profile: dict = Field(default_factory=dict)
+    profile_status: str | None = None
+    canonical_intent: dict = Field(default_factory=dict)
+    intent_status: str | None = None
+    clarification: dict | None = None
+    execution: dict | None = None
+    repair_available: bool = False
 
 
 class UploadSummary(BaseModel):
@@ -261,7 +267,13 @@ class JobDetailRead(BaseModel):
     detected_types: dict = Field(default_factory=dict)
     validation: dict = Field(default_factory=dict)
     preview_rows: list[dict] = Field(default_factory=list)
-    schema_proposal: dict = Field(default_factory=dict)
+    data_profile: dict = Field(default_factory=dict)
+    profile_status: str | None = None
+    canonical_intent: dict = Field(default_factory=dict)
+    intent_status: str | None = None
+    clarification: dict | None = None
+    execution: dict | None = None
+    repair_available: bool = False
     preview_token: str | None = None
     steps: list[JobStepRead] = Field(default_factory=list)
     audit: list[JobAuditEntryRead] = Field(default_factory=list)

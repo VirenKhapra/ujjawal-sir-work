@@ -55,6 +55,8 @@ def run_new_semantic_pipeline_sync(
     *,
     column_types: dict[str, str] | None = None,
     output_format: str = "xlsx",
+    submission_id: str = "",
+    trigger: str = "upload",
 ) -> dict[str, Any] | None:
     """Run the new semantic extraction + grounding pipeline synchronously.
 
@@ -77,7 +79,15 @@ def run_new_semantic_pipeline_sync(
         return None
 
     try:
-        return _run_pipeline(instruction, source_columns, column_types, output_format, api_key)
+        return _run_pipeline(
+            instruction,
+            source_columns,
+            column_types,
+            output_format,
+            api_key,
+            submission_id=submission_id,
+            trigger=trigger,
+        )
     except Exception:
         logger.exception("new_pipeline_bridge: unhandled error — falling back to legacy")
         return None
@@ -94,6 +104,9 @@ def _run_pipeline(
     column_types: dict[str, str] | None,
     output_format: str,
     api_key: str,
+    *,
+    submission_id: str,
+    trigger: str,
 ) -> dict[str, Any] | None:
     """Core implementation — may raise on import/runtime failure."""
     # Lazy import to avoid crashing the backend if finflow_agent is unavailable
@@ -126,7 +139,7 @@ def _run_pipeline(
         return None
 
     # Build resolver and extractor
-    resolver = _GroqResolver(api_key)
+    resolver = _GroqResolver(api_key, submission_id=submission_id, trigger=trigger)
     extractor = SemanticExtractor(resolver)
 
     schema_context = SchemaContext(
@@ -163,10 +176,12 @@ def _run_pipeline(
 class _GroqResolver:
     """Minimal Groq LLM adapter satisfying the SemanticResolver protocol."""
 
-    def __init__(self, api_key: str) -> None:
+    def __init__(self, api_key: str, *, submission_id: str = "", trigger: str = "upload") -> None:
         self._api_key = api_key
         self._base_url = "https://api.groq.com/openai/v1/chat/completions"
-        self._model = os.environ.get("GROQ_BRIDGE_MODEL", "gemma2-9b-it")
+        self._model = os.environ.get("GROQ_BRIDGE_MODEL", "llama-3.3-70b-versatile")
+        self._submission_id = submission_id
+        self._trigger = trigger
 
     async def call(
         self,
@@ -182,7 +197,22 @@ class _GroqResolver:
 
         # --- Telemetry: log call start ---
         try:
-            from app.services.llm_telemetry import log_llm_started, log_llm_completed, log_llm_failed
+            from app.services.llm_telemetry import log_llm_started, log_llm_completed, log_llm_failed, log_runtime_event
+            log_runtime_event(
+                "canonical_extractor_entered",
+                service="backend",
+                operation="new_pipeline_extraction",
+                trigger=self._trigger,
+                submission_id=self._submission_id,
+                http_method="POST" if self._trigger == "upload" else "",
+                instruction_present=True,
+                canonical_intent_present=False,
+                legacy_schema_state_present=False,
+                messages=messages,
+                model=self._model,
+                api_key=self._api_key,
+                api_key_source="GROQ_BRIDGE_API_KEY",
+            )
             _telemetry_ctx = log_llm_started(
                 service="backend",
                 operation="new_pipeline_extraction",
@@ -194,6 +224,8 @@ class _GroqResolver:
                 attempt=1,
                 trigger=str(call_site),
                 messages=messages,
+                submission_id=self._submission_id,
+                http_method="POST" if self._trigger == "upload" else "",
             )
         except Exception:
             _telemetry_ctx = None
@@ -552,50 +584,11 @@ def _convert_filter(action: Any) -> dict[str, Any]:
         for pred in group.predicates:
             field_ref = _ref_to_legacy(pred.field_ref)
             operator = _map_operator_to_legacy(pred.operator)
-            value = pred.value
-            # Preserve set-membership semantics explicitly. The legacy filter
-            # schema only understands flat conditions, so a predicate like
-            # ``value=["paypal", "cash"]`` must be expanded to multiple
-            # scalar conditions instead of being stringified into one literal.
-            if str(pred.operator).strip().lower() == "in" and isinstance(
-                value, (list, tuple, set)
-            ):
-                members = [item for item in value if item is not None]
-                if not members:
-                    continue
-                for item in members:
-                    conditions.append(
-                        {
-                            "field": field_ref,
-                            "operator": "contains",
-                            "value": item,
-                        }
-                    )
-                logic = "or" if logic is None else logic
-                continue
-
-            if str(pred.operator).strip().lower() == "not_in" and isinstance(
-                value, (list, tuple, set)
-            ):
-                members = [item for item in value if item is not None]
-                if not members:
-                    continue
-                for item in members:
-                    conditions.append(
-                        {
-                            "field": field_ref,
-                            "operator": "neq",
-                            "value": item,
-                        }
-                    )
-                logic = "and" if logic is None else logic
-                continue
-
             conditions.append(
                 {
                     "field": field_ref,
                     "operator": operator,
-                    "value": value,
+                    "value": pred.value,
                 }
             )
             if logic is None:
@@ -664,9 +657,9 @@ def _map_operator_to_legacy(operator: str) -> str:
         "<": "lt",
         "lte": "lte",
         "<=": "lte",
-        "in": "contains",
+        "in": "in",
         "contains": "contains",
-        "not_in": "contains",
+        "not_in": "not_in",
         "is_null": "eq",
         "is_not_null": "neq",
     }

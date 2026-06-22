@@ -356,7 +356,20 @@ def _llm_ground_clause(
     # --- Telemetry: log call start ---
     _telemetry_ctx = None
     try:
-        from finflow_agent.llm_telemetry import log_llm_started, log_llm_completed, log_llm_failed
+        from finflow_agent.llm_telemetry import log_llm_started, log_llm_completed, log_llm_failed, log_runtime_event
+        log_runtime_event(
+            "predicate_grounding_llm_entered",
+            service="agent-service",
+            trigger="worker",
+            instruction_present=False,
+            canonical_intent_present=True,
+            legacy_schema_state_present=False,
+            requested_field=clause.requested_field,
+            prompt_text=f"requested_field={clause.requested_field}, operator={clause.operator}, value={clause.value}",
+            model="llama-3.3-70b-versatile",
+            api_key=os.environ.get("GROQ_API_KEY", ""),
+            api_key_source="GROQ_API_KEY",
+        )
         _telemetry_ctx = log_llm_started(
             service="agent-service",
             operation="predicate_grounding",

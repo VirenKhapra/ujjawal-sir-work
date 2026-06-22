@@ -20,9 +20,10 @@ from app.models import AuditAction, CallbackEvent, DeadLetterJob, NeedsReviewJob
 from app.schemas import AgentRead, AgentRegisterRequest, AgentTokenResponse, LoginRequest, UploadPreview
 from app.services.alerts import create_quarantine_alert
 from app.services.audit import log_action
+from app.services.llm_telemetry import log_runtime_event, safe_summary_keys
 from app.services.quarantine import requeue_quarantined_submissions
 from app.services.request_security import enforce_rate_limit
-from app.services.schema_proposal import make_json_safe
+from app.services.json_safety import make_json_safe
 from app.services.submission_results import persist_submission_results
 from app.services.websocket_manager import ws_manager
 
@@ -303,6 +304,44 @@ def _derive_callback_event_id(payload: AgentCallbackPayload) -> str:
     return f"callback:{payload.submission_id}:{digest}"
 
 
+def _merge_callback_summary(existing_summary: dict[str, object] | None, callback_summary: dict | None) -> dict | None:
+    if not isinstance(existing_summary, dict):
+        existing_summary = {}
+    if not isinstance(callback_summary, dict):
+        return callback_summary
+
+    merged = dict(existing_summary)
+    protected_keys = {
+        "canonical_intent",
+        "canonical_intent_schema_version",
+        "canonical_intent_status",
+        "intent_id",
+        "intent_revision",
+        "intent_hash",
+        "parent_intent_id",
+        "grounded_at",
+        "capability_version",
+        "intent_extractor_version",
+        "intent_normalizer_version",
+        "intent_grounding_version",
+        "intent_created_at",
+        "original_instruction",
+        "data_profile",
+        "profile_status",
+        "file_fingerprint",
+        "profiler_version",
+    }
+    for key, value in callback_summary.items():
+        if key in protected_keys:
+            continue
+        merged[key] = value
+
+    for key in protected_keys:
+        if key not in merged and key in existing_summary:
+            merged[key] = existing_summary[key]
+    return merged
+
+
 async def _mark_callback_side_effect_failed(
     db: AsyncSession,
     *,
@@ -497,6 +536,7 @@ async def agent_callback(
             db.add(callback_event)
 
         submission.status = map_agent_status_to_submission_status(payload.status)
+        prior_summary = submission.summary if isinstance(submission.summary, dict) else {}
         summary_has_error = False
         if isinstance(payload.summary, dict):
             summary_has_error = bool(_clean_error_text(payload.summary.get("error")))
@@ -506,7 +546,33 @@ async def agent_callback(
         if summary_has_error and submission.status == SubmissionStatus.succeeded:
             submission.status = SubmissionStatus.failed
 
-        submission.summary = payload.summary
+        merged_summary = _merge_callback_summary(prior_summary, payload.summary)
+        log_runtime_event(
+            "callback_summary_keys_before",
+            service="backend",
+            trigger="callback",
+            submission_id=str(submission.id),
+            job_id=str(payload.job_id or ""),
+            instruction_present=bool(str(submission.instruction or "").strip()),
+            canonical_intent_present=isinstance(submission.canonical_intent, dict) or "canonical_intent" in prior_summary,
+            legacy_schema_state_present="legacy_schema_state" in prior_summary,
+            summary_keys=safe_summary_keys(prior_summary),
+            callback_summary_keys=safe_summary_keys(payload.summary),
+        )
+        submission.summary = merged_summary
+        log_runtime_event(
+            "callback_summary_keys_after",
+            service="backend",
+            trigger="callback",
+            submission_id=str(submission.id),
+            job_id=str(payload.job_id or ""),
+            instruction_present=bool(str(submission.instruction or "").strip()),
+            canonical_intent_present=isinstance(submission.canonical_intent, dict) or "canonical_intent" in (merged_summary or {}),
+            legacy_schema_state_present="legacy_schema_state" in (merged_summary or {}),
+            summary_keys=safe_summary_keys(merged_summary),
+            callback_summary_keys=safe_summary_keys(payload.summary),
+            lost_summary_keys=sorted(set(safe_summary_keys(prior_summary)) - set(safe_summary_keys(merged_summary))),
+        )
         if payload.output_path:
             submission.output_path = payload.output_path
             submission.output_file_path = payload.output_path

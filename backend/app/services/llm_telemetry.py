@@ -1,11 +1,16 @@
 """LLM call telemetry — structured logging for every Groq API interaction."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import logging
+import os
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("llm_telemetry")
@@ -15,6 +20,10 @@ if not logger.handlers:
     _handler.setFormatter(logging.Formatter("%(name)s | %(message)s"))
     logger.addHandler(_handler)
     logger.setLevel(logging.DEBUG)
+
+_LOG_LOCK = threading.Lock()
+_DEFAULT_LOG_DIR = "logs"
+_DEFAULT_LOG_FILE = "backend_llm_telemetry.jsonl"
 
 
 def _safe_key_fingerprint(api_key: str) -> str:
@@ -41,6 +50,110 @@ def _prompt_stats(messages: list) -> dict:
     }
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _log_path() -> Path:
+    root = Path(
+        os.environ.get("FINFLOW_DIAGNOSTIC_LOG_DIR")
+        or os.environ.get("LLM_TELEMETRY_LOG_DIR")
+        or _DEFAULT_LOG_DIR
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    return root / _DEFAULT_LOG_FILE
+
+
+def _write_entry(entry: dict[str, Any]) -> None:
+    payload = json.dumps(entry, sort_keys=True, default=str)
+    logger.info(payload)
+    with _LOG_LOCK:
+        with _log_path().open("a", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.write("\n")
+
+
+def safe_summary_keys(value: Any) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    return sorted(str(key) for key in value.keys())
+
+
+def make_prompt_metadata(
+    *,
+    messages: list[dict[str, Any]] | None = None,
+    prompt_text: str | None = None,
+) -> dict[str, Any]:
+    if messages:
+        stats = _prompt_stats(messages)
+        return {
+            "prompt_hash": _prompt_hash(messages),
+            "prompt_character_count": stats["system_prompt_characters"] + stats["user_prompt_characters"],
+            "message_count": stats["message_count"],
+            **stats,
+        }
+    if prompt_text:
+        return {
+            "prompt_hash": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16],
+            "prompt_character_count": len(prompt_text),
+            "message_count": 1,
+            "system_prompt_characters": 0,
+            "user_prompt_characters": len(prompt_text),
+        }
+    return {
+        "prompt_hash": "",
+        "prompt_character_count": 0,
+        "message_count": 0,
+        "system_prompt_characters": 0,
+        "user_prompt_characters": 0,
+    }
+
+
+def log_runtime_event(
+    event: str,
+    *,
+    service: str = "backend",
+    trigger: str = "",
+    submission_id: str = "",
+    job_id: str = "",
+    logical_call_id: str = "",
+    physical_attempt_id: str = "",
+    instruction_present: bool | None = None,
+    canonical_intent_present: bool | None = None,
+    legacy_schema_state_present: bool | None = None,
+    model: str = "",
+    api_key: str = "",
+    api_key_source: str = "",
+    http_method: str = "",
+    intent_revision_id: str = "",
+    messages: list[dict[str, Any]] | None = None,
+    prompt_text: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "event": event,
+        "timestamp": _utc_now_iso(),
+        "service": service,
+        "trigger": trigger,
+        "submission_id": submission_id,
+        "job_id": job_id,
+        "logical_call_id": logical_call_id,
+        "physical_attempt_id": physical_attempt_id,
+        "instruction_present": instruction_present,
+        "canonical_intent_present": canonical_intent_present,
+        "legacy_schema_state_present": legacy_schema_state_present,
+        "model": model,
+        "api_key_source": api_key_source,
+        "api_key_fingerprint": _safe_key_fingerprint(api_key),
+        "http_method": http_method,
+        "intent_revision_id": intent_revision_id,
+        **make_prompt_metadata(messages=messages, prompt_text=prompt_text),
+        **extra,
+    }
+    _write_entry(entry)
+    return entry
+
+
 def log_llm_started(
     *,
     service: str,
@@ -55,6 +168,8 @@ def log_llm_started(
     messages: list,
     submission_id: str = "",
     job_id: str = "",
+    intent_revision_id: str = "",
+    http_method: str = "",
     correlation_id: str = "",
     endpoint_or_worker: str = "",
 ) -> dict:
@@ -68,6 +183,8 @@ def log_llm_started(
         "physical_attempt_id": physical_attempt_id,
         "job_id": job_id,
         "submission_id": submission_id,
+        "intent_revision_id": intent_revision_id,
+        "http_method": http_method,
         "correlation_id": correlation_id,
         "service": service,
         "endpoint_or_worker": endpoint_or_worker,
@@ -81,9 +198,9 @@ def log_llm_started(
         "trigger": trigger,
         "prompt_hash": _prompt_hash(messages),
         **_prompt_stats(messages),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": _utc_now_iso(),
     }
-    logger.info(json.dumps(entry))
+    _write_entry(entry)
     return {
         "logical_call_id": logical_call_id,
         "physical_attempt_id": physical_attempt_id,
@@ -117,9 +234,9 @@ def log_llm_completed(
         "total_tokens": total_tokens,
         "duration_ms": round(duration_ms, 1),
         "finish_reason": finish_reason,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": _utc_now_iso(),
     }
-    logger.info(json.dumps(entry))
+    _write_entry(entry)
 
 
 def log_llm_failed(
@@ -151,33 +268,6 @@ def log_llm_failed(
         "rate_limit_remaining_tokens": hdrs.get("x-ratelimit-remaining-tokens", ""),
         "rate_limit_reset_tokens": hdrs.get("x-ratelimit-reset-tokens", ""),
         "duration_ms": round(duration_ms, 1),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": _utc_now_iso(),
     }
-    logger.info(json.dumps(entry))
-
-
-def log_polling_decision(
-    *,
-    submission_id: str,
-    endpoint: str,
-    schema_proposal_present: bool,
-    summary_present: bool,
-    canonical_intent_present: bool,
-    fallback_reason: str = "",
-    will_rebuild: bool = False,
-    will_call_llm: bool = False,
-) -> None:
-    """Log the decision made inside get_schema_proposal_with_fallback."""
-    entry = {
-        "event": "polling_decision",
-        "submission_id": submission_id,
-        "endpoint": endpoint,
-        "schema_proposal_present": schema_proposal_present,
-        "summary_present": summary_present,
-        "canonical_intent_present": canonical_intent_present,
-        "fallback_reason": fallback_reason,
-        "will_rebuild": will_rebuild,
-        "will_call_llm": will_call_llm,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    logger.info(json.dumps(entry))
+    _write_entry(entry)

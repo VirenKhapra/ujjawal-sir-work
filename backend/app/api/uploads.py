@@ -16,15 +16,18 @@ from app.core.config import get_settings
 from app.constants import DEFAULT_OUTPUT_FORMAT_OPTIONS
 from app.core.security import require_roles
 from app.db.session import get_db
-from app.models import AuditLog, Review, Submission, SubmissionRecord, SubmissionStatus, User, UserRole, normalize_submission_status
+from app.models import AuditLog, DataProfile, Review, Submission, SubmissionRecord, SubmissionStatus, User, UserRole, normalize_submission_status
 from app.services.agent_dispatcher import enqueue_submission_dispatch
+from app.services.canonical_intent import build_canonical_intent
 from app.services.intent_revision import persist_intent_revision
 from app.schemas import JobAgentSummaryRead, JobAuditEntryRead, JobDetailRead, JobStepRead, UploadMetadataRead, UploadPreview, UploadSummary, UploadVersionRead
 from app.services.excel_parser import SUPPORTED_EXTENSIONS, validate_extension
 from app.services.file_validation import validate_file_signature
+from app.services.data_profile import get_or_create_data_profile, load_latest_data_profile
+from app.services.json_safety import make_json_safe
 from app.services.quarantine import is_quarantined_submission, requeue_submission
 from app.services.request_security import enforce_rate_limit
-from app.services.schema_proposal import build_schema_proposal_from_file
+from app.services.llm_telemetry import log_runtime_event
 from app.services.structured_output import sanitize_structured_row, sanitize_structured_rows
 from app.services.websocket_manager import ws_manager
 from pydantic import BaseModel
@@ -143,107 +146,71 @@ def is_schema_approval_pending(submission: Submission) -> bool:
     return _submission_status_text(submission.status) == SCHEMA_APPROVAL_AGENT_STATUS
 
 
-def get_schema_proposal(submission: Submission) -> dict:
-    payload = submission.summary if isinstance(submission.summary, dict) else {}
-    schema_proposal = payload.get("schema_proposal")
-    return schema_proposal if isinstance(schema_proposal, dict) else {}
-
-
-def get_schema_proposal_with_fallback(submission: Submission) -> dict:
-    schema_proposal = get_schema_proposal(submission)
-    if schema_proposal:
-        return schema_proposal
-
-    payload = submission.summary if isinstance(submission.summary, dict) else {}
-    recovered = _build_recovered_schema_proposal(payload)
-    if recovered:
-        return recovered
-
-    file_path = Path(str(submission.file_path or "").strip())
-    if not file_path.exists():
+def _data_profile_payload(record: DataProfile | None) -> dict:
+    if record is None or not isinstance(record.profile_json, dict):
         return {}
-
-    if file_path.suffix.lower() not in SCHEMA_APPROVAL_TABULAR_EXTENSIONS:
-        return {}
-
-    # --- Telemetry: log polling decision ---
-    try:
-        from app.services.llm_telemetry import log_polling_decision
-        log_polling_decision(
-            submission_id=str(getattr(submission, "id", "")),
-            endpoint="get_schema_proposal_with_fallback",
-            schema_proposal_present=False,
-            summary_present=bool(payload),
-            canonical_intent_present=bool(payload.get("canonical_intent")),
-            fallback_reason="schema_proposal missing, recovered failed, rebuilding from file",
-            will_rebuild=True,
-            will_call_llm=False,
-        )
-    except Exception:
-        pass
-    # --- End telemetry ---
-
-    rebuilt = build_schema_proposal_from_file(
-        file_path,
-        max_preview_rows=get_settings().max_preview_rows,
-        instruction=str(submission.instruction or "").strip(),
-    )
-    if rebuilt is None:
-        return {}
-    return rebuilt[0]
+    return make_json_safe(record.profile_json)
 
 
-def _build_recovered_schema_proposal(payload: dict) -> dict:
-    cleaned_rows = payload.get("cleaned_data")
-    if not isinstance(cleaned_rows, list) or not cleaned_rows:
-        return {}
+async def _load_submission_data_profile(db: AsyncSession, submission: Submission) -> dict[str, Any]:
+    return _data_profile_payload(await load_latest_data_profile(db, submission.id))
 
-    preview_rows = [row for row in cleaned_rows if isinstance(row, dict)]
-    if not preview_rows:
-        return {}
 
-    source_columns: list[str] = []
-    seen: set[str] = set()
-    for row in preview_rows:
-        for key in row.keys():
-            column = str(key)
-            if column not in seen:
-                seen.add(column)
-                source_columns.append(column)
+def _profile_status(submission: Submission, data_profile: dict[str, Any]) -> str:
+    if data_profile:
+        return str(data_profile.get("profile_status", "ready"))
+    if isinstance(submission.summary, dict) and submission.summary:
+        return "missing_legacy_state"
+    return "missing"
 
-    if not source_columns:
-        return {}
 
-    detected_types = {column: _infer_display_type([row.get(column) for row in preview_rows]) for column in source_columns}
-    proposed_fields = [
-        {
-            "source": column,
-            "target": column,
-            "detected_type": detected_types.get(column, "string"),
-            "confidence": "medium",
-            "reason": "Recovered from the completed cleaned output because the original proposal was not retained.",
+def _compose_clarification_view(submission: Submission, canonical_intent: dict[str, Any] | None) -> dict[str, Any] | None:
+    status_text = _submission_status_text(submission.status)
+    extraction_preview = get_extraction_preview(submission)
+    if extraction_preview and status_text == SubmissionStatus.awaiting_confirmation.value:
+        return {
+            "status": "awaiting_extraction_confirmation",
+            "mode": "extraction_confirmation",
+            "reason": "The extracted preview is ready for confirmation before the output is persisted.",
+            "extraction_preview": extraction_preview,
         }
-        for column in source_columns
-    ]
-    action_schema = payload.get("action_schema")
-    if not isinstance(action_schema, dict):
-        action_schema = {"actions": []}
-
+    if status_text not in {SubmissionStatus.awaiting_confirmation.value, SubmissionStatus.awaiting_clarification.value}:
+        return None
+    if isinstance(canonical_intent, dict) and str(canonical_intent.get("resolution_status", "")).strip() in {"resolved", "repaired"}:
+        return {
+            "status": "awaiting_intent_confirmation",
+            "mode": "intent_confirmation",
+            "reason": "The canonical interpretation is ready for explicit confirmation.",
+        }
     return {
-        "status": "awaiting_schema_approval",
-        "requires_user_approval": True,
-        "schema_kind": "tabular",
-        "source_columns": source_columns,
-        "proposed_fields": proposed_fields,
-        "detected_types": detected_types,
-        "preview_rows": preview_rows[: get_settings().max_preview_rows],
-        "preview_row_count": len(preview_rows),
-        "total_rows": int(payload.get("record_count") or len(preview_rows)),
-        "action_schema": action_schema,
-        "validation_warnings": [],
-        "suggestion": "Review the recovered preview and confirm to persist and download the Excel output.",
-        "fallback_reason": "Recovered from completed output",
+        "status": "needs_clarification",
+        "mode": "clarification",
+        "reason": "The canonical interpretation still contains unresolved references.",
     }
+
+
+def _compose_execution_view(submission: Submission) -> dict[str, Any]:
+    status_text = _submission_status_text(submission.status)
+    summary = submission.summary if isinstance(submission.summary, dict) else {}
+    return {
+        "status": status_text,
+        "output_ready": output_is_available(submission),
+        "completed_at": submission.completed_at,
+        "error": summary.get("error"),
+        "review_status": summary.get("review_status"),
+    }
+
+
+def _latest_submission_profile_json(submission: Submission) -> dict[str, Any]:
+    records = getattr(submission, "data_profiles", None)
+    if not isinstance(records, list) or not records:
+        return {}
+    latest = max(
+        (record for record in records if isinstance(getattr(record, "profile_json", None), dict)),
+        key=lambda record: str(getattr(record, "created_at", "")),
+        default=None,
+    )
+    return _data_profile_payload(latest)
 
 
 def _infer_display_type(values: list[object]) -> str:
@@ -795,20 +762,46 @@ async def save_upload(
     path.write_bytes(contents)
     submission.file_path = str(path)
 
-    schema_preview = None
+    preview_records: list[dict[str, Any]] = []
+    data_profile_payload: dict[str, Any] = {}
+    canonical_intent_payload: dict[str, Any] = {}
     if should_require_schema_approval(extension=ext, instruction=instruction.strip()):
-        schema_preview = build_schema_proposal_from_file(
-            path,
+        _profile_record, data_profile_payload, preview_records = await get_or_create_data_profile(
+            db,
+            submission=submission,
+            path=path,
             max_preview_rows=settings.max_preview_rows,
-            instruction=instruction.strip(),
         )
-    if schema_preview is not None:
-        schema_proposal, preview_records = schema_preview
-        submission.status = SubmissionStatus.awaiting_schema_approval
+        if data_profile_payload:
+            canonical_intent_payload = build_canonical_intent(
+                list(data_profile_payload.get("source_columns", [])),
+                list(data_profile_payload.get("preview_rows", [])),
+                instruction.strip(),
+                output_format=normalized_output_format.lower(),
+                detected_types=data_profile_payload.get("detected_types", {}),
+                data_profile=data_profile_payload,
+                submission_id=str(submission.id),
+                trigger="upload",
+            )
+            await persist_intent_revision(
+                db,
+                submission=submission,
+                canonical_intent=canonical_intent_payload,
+                original_instruction=instruction.strip(),
+            )
+
+    if canonical_intent_payload and str(canonical_intent_payload.get("resolution_status", "")).strip() not in {"resolved", "repaired"}:
+        submission.status = SubmissionStatus.awaiting_clarification
         submission.summary = {
-            "status": SCHEMA_APPROVAL_AGENT_STATUS,
-            "schema_proposal": schema_proposal,
-            "suggestion": schema_proposal.get("suggestion"),
+            "status": "awaiting_clarification",
+            "suggestion": canonical_intent_payload.get("suggestion") or "Clarify the intended operation before processing continues.",
+            "canonical_intent": canonical_intent_payload,
+        }
+    elif canonical_intent_payload:
+        submission.summary = {
+            "status": "canonical_ready",
+            "suggestion": None,
+            "canonical_intent": canonical_intent_payload,
         }
 
     await db.commit()
@@ -818,25 +811,25 @@ async def save_upload(
         "upload_id": submission.id,
         "filename": submission.file_name,
         "status": _submission_status_text(submission.status),
-        "total_rows": int(schema_preview[0].get("total_rows", len(schema_preview[1]))) if schema_preview is not None else 0,
+        "total_rows": int(data_profile_payload.get("row_count", 0) or 0),
     }
     payload["agent_status"] = _submission_status_text(submission.status)
     await ws_manager.broadcast("uploads", "upload_progress", {**payload, "progress": 40})
     await ws_manager.broadcast(
         "uploads",
-        "upload.processing" if schema_preview is None else "upload.schema_review",
+        "upload.processing" if _submission_status_text(submission.status) == SubmissionStatus.queued.value else "upload.intent_review",
         payload,
     )
     await ws_manager.broadcast("uploads", "upload_status", payload)
     await ws_manager.broadcast("dashboard", "dashboard_refresh", payload)
 
-    if schema_preview is None:
+    if canonical_intent_payload and str(canonical_intent_payload.get("resolution_status", "")).strip() in {"resolved", "repaired"}:
         submission.status = SubmissionStatus.queued
         await db.commit()
         await db.refresh(submission)
         payload["agent_status"] = _submission_status_text(submission.status)
         try:
-            await enqueue_submission_dispatch(submission.id)
+            await enqueue_submission_dispatch(submission.id, persist_revision=False)
         except Exception as exc:
             submission.status = SubmissionStatus.failed
             submission.summary = {'error': f"Unable to enqueue agent dispatch: {exc}"} if not isinstance(submission.summary, dict) else {**submission.summary, 'error': f"Unable to enqueue agent dispatch: {exc}"}
@@ -866,25 +859,31 @@ async def save_upload(
         status=_submission_status_text(submission.status),
         version_number=submission.version_number,
         parent_submission_id=submission.parent_submission_id,
-        total_rows=int(schema_preview[0].get("total_rows", len(schema_preview[1]))) if schema_preview is not None else 0,
-        total_columns=len(schema_preview[0].get("source_columns", [])) if schema_preview is not None else 0,
+        total_rows=int(data_profile_payload.get("row_count", 0) or 0),
+        total_columns=len(data_profile_payload.get("source_columns", [])) if data_profile_payload else 0,
         created_at=submission.uploaded_at,
-        columns=schema_preview[0].get("source_columns", []) if schema_preview is not None else [],
-        detected_types=schema_preview[0].get("detected_types", {}) if schema_preview is not None else {},
+        columns=data_profile_payload.get("source_columns", []) if data_profile_payload else [],
+        detected_types=data_profile_payload.get("detected_types", {}) if data_profile_payload else {},
         reviewed_at=submission.completed_at,
         validation={
-            "valid": None,
-            "status": SCHEMA_APPROVAL_AGENT_STATUS if schema_preview is not None else _submission_status_text(submission.status),
+            "valid": None if _submission_status_text(submission.status) in {SubmissionStatus.queued.value, SubmissionStatus.planning.value, SubmissionStatus.awaiting_confirmation.value, SubmissionStatus.awaiting_clarification.value} else True,
+            "status": _submission_status_text(submission.status),
         },
-        preview_rows=preview_records if schema_preview is not None else [],
+        preview_rows=preview_records,
         version_history=await get_version_history(db, submission),
         preferred_agent_name=submission.preferred_agent_name,
         job_summary=(
-            "Review the proposed schema mapping and approve it to continue."
-            if schema_preview is not None
+            "Clarify or confirm the canonical interpretation before processing continues."
+            if _submission_status_text(submission.status) in {SubmissionStatus.awaiting_confirmation.value, SubmissionStatus.awaiting_clarification.value}
             else None
         ),
-        schema_proposal=schema_preview[0] if schema_preview is not None else {},
+        data_profile=data_profile_payload,
+        profile_status=str(data_profile_payload.get("profile_status", "ready")) if data_profile_payload else None,
+        canonical_intent=canonical_intent_payload,
+        intent_status=str(canonical_intent_payload.get("resolution_status", "")) if canonical_intent_payload else None,
+        clarification=_compose_clarification_view(submission, canonical_intent_payload),
+        execution=_compose_execution_view(submission),
+        repair_available=False,
     )
 
 
@@ -971,117 +970,13 @@ async def retry_submission_dispatch(*, submission: Submission, db: AsyncSession,
     await requeue_submission(db, submission=submission, actor=user, preferred_agent_name=preferred_agent_name)
 
 
-@router.post("/{upload_id}/schema-approve", response_model=UploadPreview)
-async def approve_schema_proposal(
-    upload_id: UUID,
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(require_roles(UserRole.employee, UserRole.admin)),
-) -> UploadPreview:
-    submission = (
-        await db.execute(
-            select(Submission)
-            .options(selectinload(Submission.user), selectinload(Submission.review))
-            .where(Submission.id == upload_id)
-        )
-    ).scalar_one_or_none()
-    if not submission:
-        raise HTTPException(status_code=404, detail="Submission not found")
-    verify_upload_access(submission, user)
-    if not is_schema_approval_pending(submission):
-        raise HTTPException(status_code=409, detail="This submission is not awaiting schema approval")
-
-    result_payload = submission.summary if isinstance(submission.summary, dict) else {}
-    schema_proposal = result_payload.get("schema_proposal", {})
-    if schema_proposal.get("schema_kind") == "unstructured_extraction_preview":
-        extracted_records = schema_proposal.get("preview_rows", [])
-        import uuid
-        import json
-        unique_suffix = uuid.uuid4().hex[:8]
-        extracted_path = Path(submission.file_path).parent / f"{submission.id}_{unique_suffix}_extracted.json"
-        extracted_path.write_text(json.dumps(extracted_records))
-        submission.file_path = str(extracted_path)
-        submission.file_name = submission.file_name + f"_{unique_suffix}.json"
-
-    result_payload["schema_approval_status"] = "approved"
-    result_payload["status"] = "schema_approved"
-    submission.summary = result_payload
-    submission.status = SubmissionStatus.queued
-    submission.summary = {'error': None} if not isinstance(submission.summary, dict) else {**submission.summary, 'error': None}
-    submission.agent_task_id = None
-    await db.commit()
-    await db.refresh(submission)
-
-    await enqueue_submission_dispatch(submission.id)
-
-    payload = {
-        "upload_id": submission.id,
-        "filename": submission.file_name,
-        "status": _submission_status_text(submission.status),
-        "agent_status": _submission_status_text(submission.status),
-    }
-    await ws_manager.broadcast("uploads", "upload_status", payload)
-    await ws_manager.broadcast("uploads", "schema.approved", payload)
-    await ws_manager.broadcast("dashboard", "dashboard_refresh", payload)
-
-    return await get_upload(upload_id, db, user)
-
-
-@router.post("/{upload_id}/schema-decline", response_model=UploadPreview)
-async def decline_schema_proposal(
-    upload_id: UUID,
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(require_roles(UserRole.employee, UserRole.admin)),
-) -> UploadPreview:
-    submission = (
-        await db.execute(
-            select(Submission)
-            .options(selectinload(Submission.user), selectinload(Submission.review))
-            .where(Submission.id == upload_id)
-        )
-    ).scalar_one_or_none()
-    if not submission:
-        raise HTTPException(status_code=404, detail="Submission not found")
-    verify_upload_access(submission, user)
-    if not is_schema_approval_pending(submission):
-        raise HTTPException(status_code=409, detail="This submission is not awaiting schema approval")
-
-    result_payload = submission.summary if isinstance(submission.summary, dict) else {}
-    result_payload["schema_approval_status"] = "declined"
-    result_payload["status"] = "declined"
-    submission.summary = result_payload
-    submission.status = SubmissionStatus.declined
-    submission.summary = {'error': "Schema proposal was declined by the user."} if not isinstance(submission.summary, dict) else {**submission.summary, 'error': "Schema proposal was declined by the user."}
-    submission.completed_at = datetime.utcnow()
-    await db.commit()
-    await db.refresh(submission)
-
-    payload = {
-        "upload_id": submission.id,
-        "filename": submission.file_name,
-        "status": _submission_status_text(submission.status),
-        "agent_status": _submission_status_text(submission.status),
-        "error": _summary_text(
-            submission.summary.get("error") if isinstance(submission.summary, dict) else None,
-            default="Schema proposal was declined by the user.",
-        ),
-    }
-    await ws_manager.broadcast("uploads", "upload_status", payload)
-    await ws_manager.broadcast("uploads", "schema.declined", payload)
-    await ws_manager.broadcast("dashboard", "dashboard_refresh", payload)
-
-    return await get_upload(upload_id, db, user)
-
-
 def _current_canonical_intent_payload(submission: Submission) -> dict[str, Any] | None:
+    if isinstance(submission.canonical_intent, dict):
+        return deepcopy(submission.canonical_intent)
     summary = submission.summary if isinstance(submission.summary, dict) else {}
-    schema_proposal = summary.get("schema_proposal") if isinstance(summary.get("schema_proposal"), dict) else None
-    if schema_proposal and isinstance(schema_proposal.get("canonical_intent"), dict):
-        return deepcopy(schema_proposal["canonical_intent"])
     canonical_intent = summary.get("canonical_intent")
     if isinstance(canonical_intent, dict):
         return deepcopy(canonical_intent)
-    if isinstance(submission.canonical_intent, dict):
-        return deepcopy(submission.canonical_intent)
     return None
 
 
@@ -1289,10 +1184,11 @@ async def _persist_reviewed_canonical_intent(
 @router.post("/{upload_id}/confirm-interpretation", response_model=UploadPreview)
 async def confirm_interpretation(
     upload_id: UUID,
-    payload: ConfirmInterpretationRequest,
+    payload: ConfirmInterpretationRequest | None = None,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_roles(UserRole.employee, UserRole.manager, UserRole.admin)),
 ) -> UploadPreview:
+    payload = payload or ConfirmInterpretationRequest()
     submission = (
         await db.execute(
             select(Submission)
@@ -1304,6 +1200,11 @@ async def confirm_interpretation(
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
     verify_upload_access(submission, user)
+    if _submission_status_text(submission.status) not in {
+        SubmissionStatus.awaiting_confirmation.value,
+        SubmissionStatus.awaiting_clarification.value,
+    }:
+        raise HTTPException(status_code=409, detail="This submission is not awaiting interpretation review")
 
     canonical_intent = _current_canonical_intent_payload(submission)
     if canonical_intent is None:
@@ -1385,10 +1286,11 @@ async def replace_column_mapping(
 @router.post("/{upload_id}/reject-interpretation", response_model=UploadPreview)
 async def reject_interpretation(
     upload_id: UUID,
-    payload: RejectInterpretationRequest,
+    payload: RejectInterpretationRequest | None = None,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_roles(UserRole.employee, UserRole.manager, UserRole.admin)),
 ) -> UploadPreview:
+    payload = payload or RejectInterpretationRequest()
     submission = (
         await db.execute(
             select(Submission)
@@ -1400,6 +1302,11 @@ async def reject_interpretation(
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
     verify_upload_access(submission, user)
+    if _submission_status_text(submission.status) not in {
+        SubmissionStatus.awaiting_confirmation.value,
+        SubmissionStatus.awaiting_clarification.value,
+    }:
+        raise HTTPException(status_code=409, detail="This submission is not awaiting interpretation review")
 
     canonical_intent = _current_canonical_intent_payload(submission)
     if canonical_intent is None:
@@ -1411,8 +1318,10 @@ async def reject_interpretation(
         "canonical_intent_status": "rejected",
         "review_status": "rejected",
         "review_reason": payload.reason,
+        "status": "awaiting_clarification",
+        "suggestion": payload.reason or "Clarify the intended fields or operations so the canonical interpretation can be rebuilt.",
     }
-    submission.status = SubmissionStatus.awaiting_confirmation
+    submission.status = SubmissionStatus.awaiting_clarification
     submission.agent_task_id = None
     await db.commit()
 
@@ -1503,7 +1412,7 @@ async def list_uploads(
         .join(User, User.id == Submission.user_id)
         .join(Review, Review.submission_id == Submission.id, isouter=True)
         .join(structured_count_sq, structured_count_sq.c.submission_id == Submission.id, isouter=True)
-        .options(selectinload(Submission.user), selectinload(Submission.review))
+        .options(selectinload(Submission.user), selectinload(Submission.review), selectinload(Submission.data_profiles))
         .group_by(
             Submission.id,
             Review.reviewed_at,
@@ -1540,7 +1449,7 @@ async def list_uploads(
             parent_submission_id=submission.parent_submission_id,
             total_rows=max(
                 int(row_count or 0),
-                int(get_schema_proposal(submission).get("total_rows", 0) or 0),
+                int(_latest_submission_profile_json(submission).get("row_count", 0) or 0),
                 get_result_record_count(submission),
             ),
             total_columns=0,
@@ -1596,19 +1505,22 @@ async def get_upload(
     elif is_schema_approval_pending(submission):
         validation = {"valid": None, "status": SCHEMA_APPROVAL_AGENT_STATUS}
 
-    schema_proposal = get_schema_proposal_with_fallback(submission)
-    if not schema_proposal and status_text == SubmissionStatus.awaiting_confirmation.value:
-        schema_proposal = get_extraction_preview(submission)
-    detected_types = schema_proposal.get("detected_types") if isinstance(schema_proposal.get("detected_types"), dict) else {}
+    data_profile_payload = await _load_submission_data_profile(db, submission)
+    canonical_intent_payload = _current_canonical_intent_payload(submission) or {}
+    detected_types = (
+        data_profile_payload.get("detected_types")
+        if isinstance(data_profile_payload.get("detected_types"), dict)
+        else {}
+    )
     preview_rows = [record.payload for record in structured_rows]
     columns = build_structured_columns(structured_rows)
-    if not columns and isinstance(schema_proposal.get("source_columns"), list):
-        columns = [str(column) for column in schema_proposal.get("source_columns", [])]
-    if not preview_rows and isinstance(schema_proposal.get("preview_rows"), list):
-        preview_rows = [row for row in schema_proposal.get("preview_rows", []) if isinstance(row, dict)]
+    if not columns and isinstance(data_profile_payload.get("source_columns"), list):
+        columns = [str(column) for column in data_profile_payload.get("source_columns", [])]
+    if not preview_rows and isinstance(data_profile_payload.get("preview_rows"), list):
+        preview_rows = [row for row in data_profile_payload.get("preview_rows", []) if isinstance(row, dict)]
     total_rows = max(
         int(structured_row_count or 0),
-        int(schema_proposal.get("total_rows", 0) or 0),
+        int(data_profile_payload.get("row_count", 0) or 0),
         get_result_record_count(submission),
     )
 
@@ -1631,7 +1543,13 @@ async def get_upload(
         preview_rows=preview_rows,
         version_history=await get_version_history(db, submission),
         preferred_agent_name=submission.preferred_agent_name,
-        schema_proposal=schema_proposal,
+        data_profile=data_profile_payload,
+        profile_status=_profile_status(submission, data_profile_payload),
+        canonical_intent=canonical_intent_payload,
+        intent_status=str(canonical_intent_payload.get("resolution_status", "missing")) if canonical_intent_payload else "missing",
+        clarification=_compose_clarification_view(submission, canonical_intent_payload),
+        execution=_compose_execution_view(submission),
+        repair_available=not data_profile_payload and bool(submission.file_path),
     )
 
 
@@ -1669,16 +1587,19 @@ async def get_job_detail(
         )
     ).scalars().all()
     status_text = _submission_status_text(submission.status)
-    schema_proposal = get_schema_proposal_with_fallback(submission)
-    if not schema_proposal and status_text == SubmissionStatus.awaiting_confirmation.value:
-        schema_proposal = get_extraction_preview(submission)
-    detected_types = schema_proposal.get("detected_types") if isinstance(schema_proposal.get("detected_types"), dict) else {}
+    data_profile_payload = await _load_submission_data_profile(db, submission)
+    canonical_intent_payload = _current_canonical_intent_payload(submission) or {}
+    detected_types = (
+        data_profile_payload.get("detected_types")
+        if isinstance(data_profile_payload.get("detected_types"), dict)
+        else {}
+    )
     preview_rows = [record.payload for record in structured_rows]
     columns = build_structured_columns(structured_rows)
-    if not columns and isinstance(schema_proposal.get("source_columns"), list):
-        columns = [str(column) for column in schema_proposal.get("source_columns", [])]
-    if not preview_rows and isinstance(schema_proposal.get("preview_rows"), list):
-        preview_rows = [row for row in schema_proposal.get("preview_rows", []) if isinstance(row, dict)]
+    if not columns and isinstance(data_profile_payload.get("source_columns"), list):
+        columns = [str(column) for column in data_profile_payload.get("source_columns", [])]
+    if not preview_rows and isinstance(data_profile_payload.get("preview_rows"), list):
+        preview_rows = [row for row in data_profile_payload.get("preview_rows", []) if isinstance(row, dict)]
 
     validation = {"valid": True, "status": SubmissionStatus.succeeded.value}
     if status_text == SubmissionStatus.running.value:
@@ -1704,7 +1625,13 @@ async def get_job_detail(
         detected_types=detected_types,
         validation=validation,
         preview_rows=preview_rows,
-        schema_proposal=schema_proposal,
+        data_profile=data_profile_payload,
+        profile_status=_profile_status(submission, data_profile_payload),
+        canonical_intent=canonical_intent_payload,
+        intent_status=str(canonical_intent_payload.get("resolution_status", "missing")) if canonical_intent_payload else "missing",
+        clarification=_compose_clarification_view(submission, canonical_intent_payload),
+        execution=_compose_execution_view(submission),
+        repair_available=not data_profile_payload and bool(submission.file_path),
         steps=build_job_steps(submission),
         audit=build_job_audit(submission, logs),
     )
@@ -1858,7 +1785,9 @@ def build_agent_execution_summary(submission: Submission) -> str:
         if agents:
             return f"Completed by {agents}."
     if is_schema_approval_pending(submission):
-        return "Waiting for schema approval before agent execution starts."
+        return "Waiting for clarification or explicit confirmation before agent execution starts."
+    if status_text in {SubmissionStatus.awaiting_confirmation.value, SubmissionStatus.awaiting_clarification.value}:
+        return "Waiting for clarification or explicit confirmation before dispatch."
     if isinstance(selected_agent, str) and selected_agent.strip():
         if status_text == SubmissionStatus.running.value:
             return f"{selected_agent.strip()} is currently processing this workflow."
@@ -1888,6 +1817,10 @@ def build_job_steps(submission: Submission) -> list[JobStepRead]:
         "rejected",
     }
     schema_review_pending = is_schema_approval_pending(submission)
+    interpretation_review_pending = status_text in {
+        SubmissionStatus.awaiting_confirmation.value,
+        SubmissionStatus.awaiting_clarification.value,
+    }
 
     queue_status = "complete" if submission.dispatched_at else "running"
     queue_summary = (
@@ -1929,12 +1862,20 @@ def build_job_steps(submission: Submission) -> list[JobStepRead]:
         execution_status = "running"
     if schema_review_pending:
         queue_status = "complete"
-        queue_summary = "Schema proposal prepared and waiting for user confirmation."
+        queue_summary = "Canonical interpretation prepared and waiting for user confirmation."
         execution_status = "blocked"
         execution_time = None
         output_status = "blocked"
         output_time = None
-        output_summary = "Processing will begin after the schema proposal is approved."
+        output_summary = "Processing will begin after the interpretation is confirmed or clarified."
+    if interpretation_review_pending:
+        queue_status = "complete"
+        queue_summary = "Canonical interpretation prepared and waiting for clarification or confirmation."
+        execution_status = "blocked"
+        execution_time = None
+        output_status = "blocked"
+        output_time = None
+        output_summary = "Processing will begin after the interpretation is confirmed or clarified."
     if quarantined_workflow:
         queue_status = "complete" if submission.dispatched_at else "running"
         queue_summary = (
@@ -1954,7 +1895,16 @@ def build_job_steps(submission: Submission) -> list[JobStepRead]:
     return [
         JobStepRead(name="Ingestion", status="complete", summary="File upload accepted and staged.", time=uploaded_time),
         JobStepRead(name="Workflow routing", status=queue_status, summary=queue_summary, time=dispatched_time or (reviewed_time if queue_status == "complete" else None)),
-        JobStepRead(name="Agent execution" if not schema_review_pending else "Schema approval", status=execution_status, summary=build_agent_execution_summary(submission) if not schema_review_pending else "Review the proposed schema mapping and approve it to continue.", time=execution_time),
+        JobStepRead(
+            name="Agent execution" if not schema_review_pending and not interpretation_review_pending else "Interpretation review",
+            status=execution_status,
+            summary=(
+                build_agent_execution_summary(submission)
+                if not schema_review_pending and not interpretation_review_pending
+                else "Review the canonical interpretation and confirm or clarify it to continue."
+            ),
+            time=execution_time,
+        ),
         JobStepRead(name="Output preparation", status=output_status, summary=output_summary, time=output_time),
     ]
 
@@ -1991,10 +1941,16 @@ def build_job_audit(submission: Submission, logs: list[AuditLog]) -> list[JobAud
                 default="Agent execution failed.",
             )
             entries.append((submission.completed_at, "workflow failed", detail))
+        elif status_text in {
+            SubmissionStatus.awaiting_confirmation.value,
+            SubmissionStatus.awaiting_clarification.value,
+        }:
+            detail = "Canonical interpretation is awaiting clarification or explicit confirmation."
+            entries.append((submission.uploaded_at, "interpretation review requested", detail))
         elif status_text == SubmissionStatus.quarantined.value:
             if is_schema_approval_pending(submission):
-                detail = "Schema proposal is awaiting user approval."
-                entries.append((submission.uploaded_at, "schema approval requested", detail))
+                detail = "Canonical interpretation is awaiting user review."
+                entries.append((submission.uploaded_at, "interpretation review requested", detail))
             else:
                 detail = _summary_text(
                     submission.summary.get("error") if isinstance(submission.summary, dict) else None,

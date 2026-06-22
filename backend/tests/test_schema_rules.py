@@ -6,9 +6,9 @@ from types import SimpleNamespace
 import pandas as pd
 
 from app.services.canonical_intent import build_canonical_intent
+from app.services.data_profile import build_data_profile_from_file
 from app.services.new_pipeline_bridge import run_new_semantic_pipeline_sync
 from app.services.rule_engine import build_validation_warnings
-from app.services.schema_proposal import build_schema_proposal_from_file
 from app.services.new_pipeline_bridge import _convert_filter
 
 
@@ -103,46 +103,34 @@ def test_canonical_intent_pauses_on_unresolved_projection_family():
     assert projection["resolution_status"] == "needs_clarification"
 
 
-def test_schema_proposal_includes_canonical_intent_without_prompt_constraints(monkeypatch):
-    csv_path = Path(__file__).with_name(".tmp_payments_actions.csv")
-    try:
-        csv_path.write_text("payment_method,amount\nPayPal,10\nCard,20\n", encoding="utf-8")
+def test_canonical_intent_select_all_projection_is_resolved():
+    columns = ["name", "amount", "status"]
 
-        result = build_schema_proposal_from_file(
-            csv_path,
-            max_preview_rows=10,
-            instruction="wipe out rows which contains paypal as a payement method",
-        )
+    projection = build_canonical_intent(columns, [], "Clean the data and return all columns.")
+
+    assert [action["kind"] for action in projection["actions"]] == ["clean", "project_columns"]
+    requested_field = projection["actions"][1]["requested_fields"][0]
+    assert requested_field["resolution_method"] == "all_columns"
+    assert requested_field["resolved_columns"] == columns
+    assert projection["resolution_status"] in {"resolved", "repaired"}
+
+
+def test_data_profile_build_is_deterministic_and_bounded():
+    csv_path = Path(__file__).with_name(".tmp_profile.csv")
+    try:
+        csv_path.write_text("name,amount,status\nAlice,10,ok\nBob,20,ok\nCharlie,30,pending\n", encoding="utf-8")
+        first = build_data_profile_from_file(csv_path, max_preview_rows=2)
+        second = build_data_profile_from_file(csv_path, max_preview_rows=2)
     finally:
         csv_path.unlink(missing_ok=True)
 
-    assert result is not None
-    proposal, preview_rows = result
-    assert len(preview_rows) == 2
-    assert proposal["canonical_intent"]["actions"][0]["kind"] == "filter_rows"
-    assert proposal["action_schema"]["source"] == "deferred_to_agent_parser"
-    assert proposal["suggested_constraints"][0]["column"] == "merchant"
-    assert "prompt_constraints" not in proposal
-
-
-def test_schema_proposal_includes_canonical_intent(monkeypatch):
-    csv_path = Path(__file__).with_name(".tmp_customer_projection.csv")
-    try:
-        csv_path.write_text("Customer_ID,Customer_Name,Amount\n1002,Alice,10\n", encoding="utf-8")
-
-        result = build_schema_proposal_from_file(
-            csv_path,
-            max_preview_rows=10,
-            instruction="return only customer id and name",
-        )
-    finally:
-        csv_path.unlink(missing_ok=True)
-
-    assert result is not None
-    proposal, _preview_rows = result
-    assert proposal["original_prompt"] == "return only customer id and name"
-    assert proposal["canonical_intent"]["actions"][0]["kind"] == "project_columns"
-    assert proposal["action_schema"]["actions"][0]["action"] == "keep_columns"
+    assert first is not None
+    assert second is not None
+    assert first[0]["file_fingerprint"] == second[0]["file_fingerprint"]
+    assert first[0]["profiler_version"] == second[0]["profiler_version"]
+    assert first[0]["row_count"] == 3
+    assert len(first[0]["preview_rows"]) == 2
+    assert len(first[0]["columns"][0]["sample_values"]) <= 3
 
 
 def test_bridge_semantic_result_repairs_generic_filter_reference_from_preview(monkeypatch):
@@ -221,11 +209,179 @@ def test_bridge_semantic_result_repairs_generic_filter_reference_from_preview(mo
 
     condition = result["actions"][0]["conditions"][0]
     assert condition["field"]["resolved_column"] == "payment_method"
-    assert condition["field"]["resolution_method"] == "profile_semantic_match"
+    assert condition["field"]["resolution_method"] == "profile_value_evidence"
     assert result["resolution_status"] == "repaired"
 
 
-def test_new_pipeline_bridge_expands_in_membership_without_stringifying():
+def test_canonical_intent_grounds_payment_field_from_observed_values(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setenv("GROQ_BRIDGE_API_KEY", "test-bridge-key")
+
+    unresolved_bridge_result = {
+        "schema_version": "2.0",
+        "intent_id": "intent-2",
+        "intent_revision": 1,
+        "intent_hash": "hash-2",
+        "parent_intent_id": None,
+        "original_prompt": "Clean the data and extract rows which contains paypal or cash as field",
+        "normalized_prompt": "clean the data and extract rows which contains paypal or cash as field",
+        "resolution_status": "needs_clarification",
+        "decision": "filter rows (1 condition(s))",
+        "evidence": ["new_pipeline_extraction: 1.0"],
+        "alternatives_considered": [],
+        "actions": [
+            {
+                "kind": "filter_rows",
+                "mode": "keep",
+                "conditions": [
+                    {
+                        "field": {
+                            "raw_reference": "field",
+                            "resolved_column": None,
+                            "resolution_method": "generic_reference",
+                            "candidate_columns": [],
+                            "evidence": [],
+                            "resolved_columns": [],
+                        },
+                        "operator": "in",
+                        "value": ["paypal", "cash"],
+                    }
+                ],
+                "logic": "and",
+            }
+        ],
+        "output_format": "xlsx",
+        "assumptions": [],
+        "repair_notes": [],
+        "dataframe_profile": {"columns": ["transaction_id", "payment_method", "transaction_status"]},
+        "capability_version": "backend.capability.1",
+        "capability_snapshot": {},
+    }
+
+    def _fake_bridge(*args, **kwargs):
+        return unresolved_bridge_result
+
+    monkeypatch.setattr("app.services.new_pipeline_bridge.run_new_semantic_pipeline_sync", _fake_bridge)
+
+    data_profile = {
+        "source_columns": ["transaction_id", "payment_method", "transaction_status"],
+        "detected_types": {
+            "transaction_id": "string",
+            "payment_method": "string",
+            "transaction_status": "string",
+        },
+        "preview_rows": [
+            {
+                "transaction_id": "T0001",
+                "payment_method": "Cash",
+                "transaction_status": "Pending",
+            },
+            {
+                "transaction_id": "T0002",
+                "payment_method": "PayPal",
+                "transaction_status": "Completed",
+            },
+        ],
+        "columns": [
+            {
+                "name": "transaction_id",
+                "sample_values": ["T0001", "T0002"],
+                "semantic_type_hint": "transaction_id",
+                "distinct_count": 2,
+            },
+            {
+                "name": "payment_method",
+                "sample_values": ["Cash", "PayPal"],
+                "semantic_type_hint": "payment_method",
+                "distinct_count": 2,
+            },
+            {
+                "name": "transaction_status",
+                "sample_values": ["Pending", "Completed"],
+                "semantic_type_hint": "status",
+                "distinct_count": 2,
+            },
+        ],
+    }
+
+    result = build_canonical_intent(
+        ["transaction_id", "payment_method", "transaction_status"],
+        data_profile["preview_rows"],
+        "Clean the data and extract rows which contains paypal or cash as field",
+        detected_types=data_profile["detected_types"],
+        data_profile=data_profile,
+    )
+
+    condition = result["actions"][0]["conditions"][0]
+    assert condition["field"]["resolved_column"] == "payment_method"
+    assert condition["field"]["resolution_method"] == "profile_value_evidence"
+    assert condition["operator"] == "in"
+    assert condition["value"] == ["paypal", "cash"]
+    assert result["resolution_status"] == "repaired"
+
+
+def test_canonical_intent_normalizes_membership_filter_without_bridge(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_BRIDGE_API_KEY", raising=False)
+
+    data_profile = {
+        "source_columns": ["transaction_id", "payment_method", "transaction_status"],
+        "detected_types": {
+            "transaction_id": "string",
+            "payment_method": "string",
+            "transaction_status": "string",
+        },
+        "preview_rows": [
+            {
+                "transaction_id": "T0001",
+                "payment_method": "Cash",
+                "transaction_status": "Pending",
+            },
+            {
+                "transaction_id": "T0002",
+                "payment_method": "PayPal",
+                "transaction_status": "Completed",
+            },
+        ],
+        "columns": [
+            {
+                "name": "payment_method",
+                "sample_values": ["Cash", "PayPal"],
+                "semantic_type_hint": "payment_method",
+                "distinct_count": 2,
+            },
+        ],
+    }
+
+    result = build_canonical_intent(
+        data_profile["source_columns"],
+        data_profile["preview_rows"],
+        "Clean the data and extract rows which contains paypal or cash as field",
+        detected_types=data_profile["detected_types"],
+        data_profile=data_profile,
+    )
+
+    filter_action = next(action for action in result["actions"] if action["kind"] == "filter_rows")
+    condition = filter_action["conditions"][0]
+    assert condition["field"]["resolved_column"] == "payment_method"
+    assert condition["operator"] == "in"
+    assert condition["value"] == ["paypal", "cash"]
+    assert result["resolution_status"] == "repaired"
+
+
+def test_canonical_intent_keeps_education_ambiguous():
+    columns = ["education_id", "education_status", "education_duration"]
+
+    result = build_canonical_intent(columns, [], "only show education")
+
+    assert [action["kind"] for action in result["actions"]] == ["project_columns"]
+    requested_field = result["actions"][0]["requested_fields"][0]
+    assert requested_field["selection_mode"] == "ambiguous"
+    assert set(requested_field["candidate_columns"]) == set(columns)
+    assert result["resolution_status"] == "needs_clarification"
+
+
+def test_new_pipeline_bridge_preserves_in_membership():
     field_ref = SimpleNamespace(
         reference_text="payment method",
         resolved_column="payment_method",
@@ -241,9 +397,10 @@ def test_new_pipeline_bridge_expands_in_membership_without_stringifying():
 
     converted = _convert_filter(action)
 
-    assert converted["logic"] == "or"
-    assert [cond["value"] for cond in converted["conditions"]] == ["paypal", "cash"]
-    assert all(cond["operator"] == "contains" for cond in converted["conditions"])
+    assert converted["logic"] == "and"
+    assert len(converted["conditions"]) == 1
+    assert converted["conditions"][0]["operator"] == "in"
+    assert converted["conditions"][0]["value"] == ["paypal", "cash"]
 
 
 def test_new_pipeline_bridge_returns_none_on_rate_limit(monkeypatch):

@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.models import CanonicalIntentRevision, IntentDispatchOutbox, Submission
+from app.services.json_safety import make_json_safe
 
 CURRENT_INTENT_SCHEMA_VERSION = "2.0"
 CURRENT_ENVELOPE_VERSION = "1.0"
@@ -37,6 +38,8 @@ SUPPORTED_CANONICAL_OPERATORS = {
     "gte",
     "lte",
     "contains",
+    "in",
+    "not_in",
 }
 
 
@@ -139,21 +142,22 @@ def build_revision_payload(
 ) -> dict[str, Any]:
     capability_snapshot = capability_snapshot or build_capability_snapshot()
     intent_id = intent_id or uuid.uuid4()
-    intent_hash = compute_intent_hash(canonical_intent)
-    grounded_at = canonical_intent.get("grounded_at") or utc_now().isoformat()
+    safe_canonical_intent = make_json_safe(canonical_intent)
+    intent_hash = compute_intent_hash(safe_canonical_intent)
+    grounded_at = safe_canonical_intent.get("grounded_at") or utc_now().isoformat()
     payload = {
         "schema_version": CURRENT_ENVELOPE_VERSION,
         "intent_id": str(intent_id),
         "intent_revision": revision,
         "intent_hash": intent_hash,
         "parent_intent_id": str(parent_intent_id) if parent_intent_id else None,
-        "intent": canonical_intent,
+        "intent": safe_canonical_intent,
         "original_instruction": original_instruction,
-        "extractor_version": canonical_intent.get("extractor_version"),
-        "normalizer_version": canonical_intent.get("normalizer_version"),
-        "grounding_version": canonical_intent.get("grounding_version"),
-        "repair_notes": list(canonical_intent.get("repair_notes", [])) if isinstance(canonical_intent.get("repair_notes"), list) else [],
-        "assumptions": list(canonical_intent.get("assumptions", [])) if isinstance(canonical_intent.get("assumptions"), list) else [],
+        "extractor_version": safe_canonical_intent.get("extractor_version"),
+        "normalizer_version": safe_canonical_intent.get("normalizer_version"),
+        "grounding_version": safe_canonical_intent.get("grounding_version"),
+        "repair_notes": list(safe_canonical_intent.get("repair_notes", [])) if isinstance(safe_canonical_intent.get("repair_notes"), list) else [],
+        "assumptions": list(safe_canonical_intent.get("assumptions", [])) if isinstance(safe_canonical_intent.get("assumptions"), list) else [],
         "capability_version": capability_snapshot.get("capability_version", CAPABILITY_VERSION),
         "capability_snapshot": capability_snapshot,
         "created_at": utc_now().isoformat(),
@@ -173,8 +177,9 @@ async def persist_intent_revision(
     revision = _next_revision(submission)
     intent_id = submission.intent_id or uuid.uuid4()
     capability_snapshot = build_capability_snapshot()
+    safe_canonical_intent = make_json_safe(canonical_intent)
     revision_payload = build_revision_payload(
-        canonical_intent=canonical_intent,
+        canonical_intent=safe_canonical_intent,
         original_instruction=original_instruction,
         parent_intent_id=parent_intent_id,
         revision=revision,
@@ -188,27 +193,27 @@ async def persist_intent_revision(
         intent_revision=revision,
         intent_hash=revision_payload["intent_hash"],
         parent_intent_id=parent_intent_id,
-        canonical_intent=canonical_intent,
+        canonical_intent=safe_canonical_intent,
         original_instruction=original_instruction,
         grounded_at=utc_now(),
         capability_version=revision_payload["capability_version"],
-        extractor_version=canonical_intent.get("extractor_version"),
-        normalizer_version=canonical_intent.get("normalizer_version"),
-        grounding_version=canonical_intent.get("grounding_version"),
+        extractor_version=safe_canonical_intent.get("extractor_version"),
+        normalizer_version=safe_canonical_intent.get("normalizer_version"),
+        grounding_version=safe_canonical_intent.get("grounding_version"),
     )
     db.add(intent_record)
 
-    submission.canonical_intent = canonical_intent
-    submission.canonical_intent_schema_version = canonical_intent.get("schema_version", CURRENT_INTENT_SCHEMA_VERSION)
-    submission.intent_status = canonical_intent.get("resolution_status", "resolved")
+    submission.canonical_intent = safe_canonical_intent
+    submission.canonical_intent_schema_version = safe_canonical_intent.get("schema_version", CURRENT_INTENT_SCHEMA_VERSION)
+    submission.intent_status = safe_canonical_intent.get("resolution_status", "resolved")
     submission.intent_id = intent_record.intent_id
     submission.intent_revision = revision
     submission.intent_hash = intent_record.intent_hash
     submission.parent_intent_id = parent_intent_id
     submission.grounded_at = intent_record.grounded_at
-    submission.intent_extractor_version = canonical_intent.get("extractor_version")
-    submission.intent_normalizer_version = canonical_intent.get("normalizer_version")
-    submission.intent_grounding_version = canonical_intent.get("grounding_version")
+    submission.intent_extractor_version = safe_canonical_intent.get("extractor_version")
+    submission.intent_normalizer_version = safe_canonical_intent.get("normalizer_version")
+    submission.intent_grounding_version = safe_canonical_intent.get("grounding_version")
     submission.intent_created_at = datetime.fromisoformat(revision_payload["created_at"])
     submission.capability_version = revision_payload["capability_version"]
 

@@ -1,12 +1,13 @@
-import React, { useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FiCheck, FiChevronDown, FiDownload, FiRefreshCw, FiX } from "react-icons/fi";
 import { useParams } from "react-router-dom";
 import DataTable from "../components/DataTable.jsx";
 import ClarificationPanel from "../components/ClarificationPanel.jsx";
 import {
-  approveSchemaProposal,
-  declineSchemaProposal,
+  confirmInterpretation,
+  rejectInterpretation,
+  replaceColumnMapping,
   downloadJobOutput,
   fetchClarificationStatus,
   fetchJobDetail,
@@ -48,7 +49,7 @@ export default function AuditPage() {
 
   // REST fallback: fetch clarification session state on page load when job is
   // already in "awaiting_clarification" status but WebSocket hasn't delivered the event yet
-  const showClarificationFromStatus = job?.status === "clarification" && !clarificationActive;
+  const showClarificationFromStatus = job?.rawStatus === "awaiting_clarification" && !clarificationActive;
   const { data: restClarificationSession } = useQuery({
     queryKey: ["clarification-status", jobId],
     queryFn: () => fetchClarificationStatus(jobId),
@@ -81,15 +82,15 @@ export default function AuditPage() {
     },
   });
 
-  const approveSchemaMutation = useMutation({
-    mutationFn: approveSchemaProposal,
+  const confirmInterpretationMutation = useMutation({
+    mutationFn: confirmInterpretation,
     onSuccess: async () => {
       await refreshJobViews(queryClient, jobId);
     },
   });
 
-  const declineSchemaMutation = useMutation({
-    mutationFn: declineSchemaProposal,
+  const rejectInterpretationMutation = useMutation({
+    mutationFn: rejectInterpretation,
     onSuccess: async () => {
       await refreshJobViews(queryClient, jobId);
     },
@@ -102,41 +103,91 @@ export default function AuditPage() {
     },
   });
 
-  const schemaProposal = job?.schemaProposal || {};
-  const schemaProposalKeys = schemaProposal && typeof schemaProposal === "object" ? Object.keys(schemaProposal) : [];
-  const schemaApprovalVisible =
-    (
-      job?.status === "schema_review"
-      || Boolean(schemaProposal.requires_user_approval)
-      || schemaProposal.schema_kind === "tabular"
-    );
-  const extractionPreviewVisible =
-    (
-      job?.status === "awaiting_confirmation"
-      || schemaProposal.schema_kind === "unstructured_extraction_preview"
-    );
-  const proposedFields = Array.isArray(schemaProposal.proposed_fields)
-    ? schemaProposal.proposed_fields.filter(f => f && typeof f === "object")
+  const dataProfile = job?.dataProfile || {};
+  const canonicalIntent = job?.canonicalIntent || {};
+  const clarification = job?.clarification || null;
+  const intentConfirmationVisible = clarification?.mode === "intent_confirmation";
+  const clarificationModeVisible = clarification?.mode === "clarification";
+  const interpretationReviewVisible =
+    intentConfirmationVisible || clarificationModeVisible;
+  const extractionPreview = clarification?.extraction_preview || job?.extractionPreview || null;
+  const extractionPreviewVisible = clarification?.mode === "extraction_confirmation" || Boolean(extractionPreview);
+  const profileColumns = Array.isArray(dataProfile.columns)
+    ? dataProfile.columns.filter(f => f && typeof f === "object")
     : [];
-  const validationWarnings = Array.isArray(schemaProposal.validation_warnings)
-    ? schemaProposal.validation_warnings.filter(w => w && typeof w === "object")
+  const extractionFields = Array.isArray(extractionPreview?.proposed_fields)
+    ? extractionPreview.proposed_fields.filter(f => f && typeof f === "object")
     : [];
-  const rawActions = schemaProposal.action_schema?.actions;
+  const validationWarnings = Array.isArray(extractionPreview?.validation_warnings)
+    ? extractionPreview.validation_warnings
+    : [];
+  const rawActions = canonicalIntent.actions;
   const actionSchema = Array.isArray(rawActions) ? rawActions.filter(a => a && typeof a === "object") : [];
-  const schemaColumns = Array.isArray(job?.columns) ? job.columns : [];
-  const schemaRows = Array.isArray(job?.previewRows) ? job.previewRows : [];
-  const detectedTypes = job?.detectedTypes && typeof job.detectedTypes === "object"
-    ? Object.entries(job.detectedTypes)
+  const schemaColumns = Array.isArray(dataProfile.source_columns) ? dataProfile.source_columns : (Array.isArray(job?.columns) ? job.columns : []);
+  const schemaRows = Array.isArray(dataProfile.preview_rows) ? dataProfile.preview_rows : (Array.isArray(job?.previewRows) ? job.previewRows : []);
+  const detectedTypes = dataProfile.detected_types && typeof dataProfile.detected_types === "object"
+    ? Object.entries(dataProfile.detected_types)
     : [];
-  const extractionAnchor = String(schemaProposal.anchor_column || "");
-  const extractionCompleteCount = Number(schemaProposal.complete_count || 0);
-  const extractionPartialCount = Number(schemaProposal.partial_count || 0);
-  const extractionInvalidCount = Number(schemaProposal.invalid_count || 0);
-  const extractionLlmOnlyCount = Number(schemaProposal.llm_only_count || 0);
-  const extractionRecoveredCount = Number(schemaProposal.recovered_count || 0);
-  const extractionMergedCount = Number(schemaProposal.merged_count || 0);
-  const extractionAmbiguousDateCount = Number(schemaProposal.ambiguous_date_count || 0);
-  const extractionAssumedDateConvention = String(schemaProposal.assumed_date_convention || "");
+  const extractionColumns = Array.isArray(extractionPreview?.source_columns) ? extractionPreview.source_columns : schemaColumns;
+  const extractionRows = Array.isArray(extractionPreview?.preview_rows) ? extractionPreview.preview_rows : schemaRows;
+  const extractionAnchor = String(extractionPreview?.anchor_column || "");
+  const extractionCompleteCount = Number(extractionPreview?.complete_count || 0);
+  const extractionPartialCount = Number(extractionPreview?.partial_count || 0);
+  const extractionInvalidCount = Number(extractionPreview?.invalid_count || 0);
+  const extractionLlmOnlyCount = Number(extractionPreview?.llm_only_count || 0);
+  const extractionRecoveredCount = Number(extractionPreview?.recovered_count || 0);
+  const extractionMergedCount = Number(extractionPreview?.merged_count || 0);
+  const extractionAmbiguousDateCount = Number(extractionPreview?.ambiguous_date_count || 0);
+  const extractionAssumedDateConvention = String(extractionPreview?.assumed_date_convention || "");
+  const availableMappingColumns = useMemo(
+    () => collectAvailableMappingColumns(profileColumns, schemaColumns),
+    [profileColumns, schemaColumns]
+  );
+  const unresolvedMappingFields = useMemo(
+    () => collectUnresolvedMappingFields(canonicalIntent),
+    [canonicalIntent]
+  );
+  const mappingInputId = `column-mapping-options-${jobId}`;
+  const [mappingDraft, setMappingDraft] = useState({});
+  const [mappingError, setMappingError] = useState("");
+
+  useEffect(() => {
+    const nextDraft = {};
+    unresolvedMappingFields.forEach((field) => {
+      nextDraft[field.sourceKey] = field.defaultValue || "";
+    });
+    setMappingDraft(nextDraft);
+    setMappingError("");
+  }, [jobId, unresolvedMappingFields]);
+
+  const replaceMappingMutation = useMutation({
+    mutationFn: ({ mapping, reason }) => replaceColumnMapping(job.backendId, mapping, reason),
+    onSuccess: async () => {
+      setMappingError("");
+      await refreshJobViews(queryClient, jobId);
+    },
+  });
+
+  const handleMappingSubmit = () => {
+    const mapping = {};
+    unresolvedMappingFields.forEach((field) => {
+      const value = parseMappingSubmissionValue(mappingDraft[field.sourceKey]);
+      if (value) {
+        mapping[field.sourceKey] = value;
+      }
+    });
+
+    if (!Object.keys(mapping).length) {
+      setMappingError("Choose at least one column mapping before applying.");
+      return;
+    }
+
+    setMappingError("");
+    replaceMappingMutation.mutate({
+      mapping,
+      reason: "Resolved through the manual clarification editor.",
+    });
+  };
 
   if (isLoading) {
     return (
@@ -196,25 +247,25 @@ export default function AuditPage() {
                 {retryMutation.isPending ? "Requeueing..." : "Retry job"}
               </button>
             ) : null}
-            {job.status === "schema_review" ? (
+            {intentConfirmationVisible ? (
               <>
                 <button
                   type="button"
                   className="ff-secondary-button"
-                  onClick={() => declineSchemaMutation.mutate(job.backendId)}
-                  disabled={approveSchemaMutation.isPending || declineSchemaMutation.isPending}
+                  onClick={() => rejectInterpretationMutation.mutate(job.backendId)}
+                  disabled={confirmInterpretationMutation.isPending || rejectInterpretationMutation.isPending}
                 >
                   <FiX size={15} />
-                  {declineSchemaMutation.isPending ? "Declining..." : "Decline schema"}
+                  {rejectInterpretationMutation.isPending ? "Rejecting..." : "Reject interpretation"}
                 </button>
                 <button
                   type="button"
                   className="ff-primary-button"
-                  onClick={() => approveSchemaMutation.mutate(job.backendId)}
-                  disabled={approveSchemaMutation.isPending || declineSchemaMutation.isPending}
+                  onClick={() => confirmInterpretationMutation.mutate(job.backendId)}
+                  disabled={confirmInterpretationMutation.isPending || rejectInterpretationMutation.isPending}
                 >
                   <FiCheck size={15} />
-                  {approveSchemaMutation.isPending ? "Approving..." : "Approve schema"}
+                  {confirmInterpretationMutation.isPending ? "Confirming..." : "Confirm intent"}
                 </button>
               </>
             ) : null}
@@ -338,26 +389,36 @@ export default function AuditPage() {
             </div>
           </div>
         ) : null}
-        {schemaApprovalVisible ? (
+        {interpretationReviewVisible ? (
           <div className="ff-panel ff-panel--dense">
             <div className="ff-panel__head">
               <div>
-                <p className="ff-eyebrow">Schema approval</p>
-                <h3>Review the proposed mapping before processing starts</h3>
+                <p className="ff-eyebrow">Interpretation review</p>
+                <h3>
+                  {intentConfirmationVisible
+                    ? "Review the canonical interpretation before processing starts"
+                    : "This job still needs clarification before processing can continue"}
+                </h3>
               </div>
             </div>
             <div className="ff-key-metrics ff-key-metrics--compact">
               <div>
-                <span>Detected structure</span>
-                <strong>{schemaProposal.schema_kind || "Tabular preview"}</strong>
+                <span>Profile status</span>
+                <strong>{job.profileStatus || "unknown"}</strong>
               </div>
               <div>
                 <span>Suggested next step</span>
-                <strong>{job.suggestion || "Approve if the field mapping looks correct."}</strong>
+                <strong>
+                  {clarification?.reason
+                    || job.suggestion
+                    || (intentConfirmationVisible
+                      ? "Confirm if the interpretation looks correct."
+                      : "Replace the mapping or add clarification before confirming intent.")}
+                </strong>
               </div>
               <div>
                 <span>Detected fields</span>
-                <strong>{schemaColumns.length || proposedFields.length}</strong>
+                <strong>{schemaColumns.length || profileColumns.length}</strong>
               </div>
               <div>
                 <span>Preview rows</span>
@@ -368,6 +429,80 @@ export default function AuditPage() {
                 <strong>{validationWarnings.length}</strong>
               </div>
             </div>
+            {clarificationModeVisible && !shouldShowClarificationPanel ? (
+              <div className="ff-template-card" style={{ marginTop: 18 }}>
+                <div>
+                  <strong>Resolve missing mapping</strong>
+                  <span>
+                    No live clarification session is active. Choose the source column for each unresolved reference below.
+                  </span>
+                </div>
+
+                {availableMappingColumns.length ? (
+                  <datalist id={mappingInputId}>
+                    {availableMappingColumns.map((column) => (
+                      <option key={column} value={column} />
+                    ))}
+                  </datalist>
+                ) : null}
+
+                <div className="ff-field-stack">
+                  {unresolvedMappingFields.length ? unresolvedMappingFields.map((field) => (
+                    <label key={field.key} className="ff-field">
+                      <span>
+                        {field.sourceLabel}
+                        {field.contextLabel ? ` - ${field.contextLabel}` : ""}
+                      </span>
+                      <div className="ff-search">
+                        <input
+                          type="text"
+                          list={availableMappingColumns.length ? mappingInputId : undefined}
+                          value={mappingDraft[field.sourceKey] || ""}
+                          onChange={(event) => {
+                            const value = event.target.value;
+                            setMappingDraft((prev) => ({
+                              ...prev,
+                              [field.sourceKey]: value,
+                            }));
+                            if (mappingError) setMappingError("");
+                          }}
+                          placeholder={field.placeholder}
+                        />
+                      </div>
+                      <small className="ff-copy-muted">{field.helperText}</small>
+                    </label>
+                  )) : (
+                    <p className="ff-copy-muted">
+                      No unresolved field references were detected in the canonical intent.
+                    </p>
+                  )}
+                </div>
+
+                <div
+                  className="ff-submit-controls"
+                  style={{ display: "flex", gap: "16px", flexWrap: "wrap", alignItems: "center" }}
+                >
+                  <button
+                    type="button"
+                    className="ff-primary-button"
+                    onClick={handleMappingSubmit}
+                    disabled={replaceMappingMutation.isPending || !unresolvedMappingFields.length}
+                  >
+                    <FiCheck size={15} />
+                    {replaceMappingMutation.isPending ? "Applying..." : "Apply mapping"}
+                  </button>
+                  <span className="ff-copy-muted">
+                    This updates the canonical intent and re-evaluates the job.
+                  </span>
+                </div>
+
+                {mappingError ? (
+                  <p className="ff-copy-muted" role="alert">
+                    {mappingError}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         ) : null}
         {extractionPreviewVisible ? (
@@ -397,7 +532,7 @@ export default function AuditPage() {
               </div>
               <div>
                 <span>Extracted fields</span>
-                <strong>{schemaColumns.length}</strong>
+                <strong>{extractionColumns.length}</strong>
               </div>
               <div>
                 <span>Recovered rows</span>
@@ -418,9 +553,9 @@ export default function AuditPage() {
                 {extractionAssumedDateConvention || "DD/MM/YYYY"}.
               </p>
             ) : null}
-            {proposedFields.length ? (
+            {extractionFields.length ? (
               <div className="ff-schema-grid" style={{ marginTop: 18 }}>
-                {proposedFields.map((field) => (
+                {extractionFields.map((field) => (
                   <div key={`${field.source}-${field.target}`} className="ff-schema-card">
                     <div className="ff-schema-card__head">
                       <strong>{field.target || field.source || "Unmapped field"}</strong>
@@ -444,30 +579,30 @@ export default function AuditPage() {
       </section>
 
       <section className="ff-detail-layout">
-        {schemaApprovalVisible ? (
+        {interpretationReviewVisible ? (
           <>
             <article className="ff-panel" style={{ gridRow: "span 2", marginBottom: "2rem" }}>
               <div className="ff-panel__head">
                 <div>
-                  <p className="ff-eyebrow">Proposed mapping</p>
-                  <h3>Source fields and their target structure</h3>
+                  <p className="ff-eyebrow">Data profile</p>
+                  <h3>Source fields and deterministic profile facts</h3>
                 </div>
               </div>
               <div className="ff-schema-grid">
-                {proposedFields.length ? proposedFields.map((field) => (
-                  <div key={`${field.source}-${field.target}`} className="ff-schema-card">
+                {profileColumns.length ? profileColumns.map((field) => (
+                  <div key={`${field.name}-${field.normalized_name}`} className="ff-schema-card">
                     <div className="ff-schema-card__head">
-                      <strong>{field.target || field.source || "Unmapped field"}</strong>
-                      <span>{formatConfidence(field.confidence)}</span>
+                      <strong>{field.name || field.normalized_name || "Unnamed field"}</strong>
+                      <span>{field.detected_type || field.physical_dtype || "unknown"}</span>
                     </div>
                     <p>
-                      <span>Source:</span> {field.source || "Unknown"}
+                      <span>Normalized:</span> {field.normalized_name || "Unknown"}
                     </p>
                     <p>
-                      <span>Detected type:</span> {field.detected_type || "Unknown"}
+                      <span>Semantic hint:</span> {field.semantic_type_hint || "None"}
                     </p>
                     <p>
-                      <span>Why:</span> {field.reason || "Matched from the uploaded structure."}
+                      <span>Distinct values:</span> {field.distinct_count ?? "Unknown"}
                     </p>
                   </div>
                 )) : (
@@ -483,32 +618,13 @@ export default function AuditPage() {
                   ))}
                 </div>
               ) : null}
-              {validationWarnings.length ? (
-                <div className="ff-schema-warning-list">
-                  {validationWarnings.map((warning) => (
-                    <div
-                      key={`${warning.column}-${warning.rule}`}
-                      className={`ff-schema-warning ff-schema-warning--${warning.severity || "warning"}`}
-                    >
-                      <strong>{warning.column}</strong>
-                      <p>{warning.reason}</p>
-                      <span>
-                        {warning.invalid_count} preview row(s) failed `{warning.rule}`
-                      </span>
-                      {Array.isArray(warning.sample_values) && warning.sample_values.length ? (
-                        <small>Examples: {warning.sample_values.join(", ")}</small>
-                      ) : null}
-                    </div>
-                  ))}
-                </div>
-              ) : null}
             </article>
 
             <article className="ff-panel" style={{ marginBottom: "2rem" }}>
               <div className="ff-panel__head">
                 <div>
-                  <p className="ff-eyebrow">Execution Actions</p>
-                  <h3>Deterministic actions applied to this dataset</h3>
+                  <p className="ff-eyebrow">Canonical intent</p>
+                  <h3>Deterministic actions derived from the instruction</h3>
                 </div>
               </div>
               <div className="ff-schema-grid">
@@ -573,7 +689,7 @@ export default function AuditPage() {
             )) : null}
           </div>
         </article>
-        {schemaApprovalVisible || extractionPreviewVisible ? (
+        {interpretationReviewVisible || extractionPreviewVisible ? (
           <article className="ff-panel" style={{ gridColumn: "1 / -1" }}>
             <div className="ff-panel__head">
               <div>
@@ -581,10 +697,10 @@ export default function AuditPage() {
                 <h3>Sample rows captured from the uploaded file</h3>
               </div>
             </div>
-            {schemaColumns.length ? (
+            {(extractionPreviewVisible ? extractionColumns : schemaColumns).length ? (
               <DataTable
-                columns={schemaColumns}
-                rows={schemaRows}
+                columns={extractionPreviewVisible ? extractionColumns : schemaColumns}
+                rows={extractionPreviewVisible ? extractionRows : schemaRows}
                 pageSize={6}
                 title="Uploaded data preview"
               />
@@ -683,4 +799,192 @@ function formatConfidence(value) {
   const numeric = Number(value);
   if (Number.isNaN(numeric)) return "Unscored";
   return `${Math.round(numeric * 100)}% confidence`;
+}
+
+function collectAvailableMappingColumns(profileColumns, schemaColumns) {
+  const values = [];
+  const seen = new Set();
+  const pushValue = (column) => {
+    const label = formatColumnLabel(column);
+    if (!label) return;
+    const key = label.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    values.push(label);
+  };
+
+  if (Array.isArray(schemaColumns)) schemaColumns.forEach(pushValue);
+  if (Array.isArray(profileColumns)) profileColumns.forEach(pushValue);
+  return values;
+}
+
+function collectUnresolvedMappingFields(canonicalIntent) {
+  const actions = Array.isArray(canonicalIntent?.actions) ? canonicalIntent.actions : [];
+  const seen = new Set();
+  const fields = [];
+
+  const pushField = ({ sourceField, sourceKey, contextLabel, helperText, placeholder }) => {
+    const label = formatFieldLabel(sourceField);
+    const key = String(sourceKey || label || "").trim();
+    if (!key) return;
+    if (seen.has(key.toLowerCase())) return;
+    seen.add(key.toLowerCase());
+    fields.push({
+      key,
+      sourceKey: key,
+      sourceLabel: label,
+      contextLabel,
+      helperText,
+      placeholder,
+      defaultValue: sourceField?.candidate_columns?.length === 1 ? formatColumnLabel(sourceField.candidate_columns[0]) : "",
+    });
+  };
+
+  actions.forEach((action, actionIndex) => {
+    if (!action || typeof action !== "object") return;
+    const kind = String(action.kind || action.action || "").trim();
+    if (kind === "project_columns" || kind === "drop_columns") {
+      (Array.isArray(action.requested_fields) ? action.requested_fields : []).forEach((field, fieldIndex) => {
+        if (!field || typeof field !== "object") return;
+        if (field.resolved_column || (Array.isArray(field.resolved_columns) && field.resolved_columns.length)) return;
+        pushField({
+          sourceField: field,
+          sourceKey: formatMappingSourceKey(field) || `${kind}-${actionIndex}-${fieldIndex}`,
+          contextLabel: formatActionKindLabel(kind),
+          helperText: "Choose one or more matching columns. Separate multiple values with commas.",
+          placeholder: "Type a column name or comma-separated list",
+        });
+      });
+      return;
+    }
+
+    if (kind === "filter_rows") {
+      (Array.isArray(action.conditions) ? action.conditions : []).forEach((condition, conditionIndex) => {
+        const field = condition?.field;
+        if (!field || typeof field !== "object") return;
+        if (field.resolved_column || (Array.isArray(field.resolved_columns) && field.resolved_columns.length)) return;
+        pushField({
+          sourceField: field,
+          sourceKey: formatMappingSourceKey(field) || `${kind}-${actionIndex}-${conditionIndex}`,
+          contextLabel: formatActionKindLabel(kind),
+          helperText: "Choose the exact column that should satisfy this filter.",
+          placeholder: "Type a single column name",
+        });
+      });
+      return;
+    }
+
+    if (kind === "sort_rows") {
+      (Array.isArray(action.sort_keys) ? action.sort_keys : []).forEach((sortKey, sortIndex) => {
+        const field = sortKey?.column;
+        if (!field || typeof field !== "object") return;
+        if (field.resolved_column || (Array.isArray(field.resolved_columns) && field.resolved_columns.length)) return;
+        pushField({
+          sourceField: field,
+          sourceKey: formatMappingSourceKey(field) || `${kind}-${actionIndex}-${sortIndex}`,
+          contextLabel: formatActionKindLabel(kind),
+          helperText: "Choose the exact column used for sorting.",
+          placeholder: "Type a single column name",
+        });
+      });
+      return;
+    }
+
+    if (kind === "visualize") {
+      (Array.isArray(action.fields) ? action.fields : []).forEach((field, fieldIndex) => {
+        if (!field || typeof field !== "object") return;
+        if (field.resolved_column || (Array.isArray(field.resolved_columns) && field.resolved_columns.length)) return;
+        pushField({
+          sourceField: field,
+          sourceKey: formatMappingSourceKey(field) || `${kind}-${actionIndex}-${fieldIndex}`,
+          contextLabel: formatActionKindLabel(kind),
+          helperText: "Choose the columns that should appear in the visualization.",
+          placeholder: "Type a column name or comma-separated list",
+        });
+      });
+      return;
+    }
+
+    if (kind === "rename_columns") {
+      (Array.isArray(action.mapping) ? action.mapping : []).forEach((mappingItem, mappingIndex) => {
+        const field = mappingItem?.source;
+        if (!field || typeof field !== "object") return;
+        if (field.resolved_column || (Array.isArray(field.resolved_columns) && field.resolved_columns.length)) return;
+        pushField({
+          sourceField: field,
+          sourceKey: formatMappingSourceKey(field) || `${kind}-${actionIndex}-${mappingIndex}`,
+          contextLabel: formatActionKindLabel(kind),
+          helperText: "Choose the source column that should be renamed.",
+          placeholder: "Type a single column name",
+        });
+      });
+    }
+  });
+
+  return fields;
+}
+
+function parseMappingSubmissionValue(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const items = raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (!items.length) return null;
+  return items.length === 1 ? items[0] : items;
+}
+
+function formatMappingSourceKey(field) {
+  if (!field || typeof field !== "object") return "";
+  const candidates = [
+    field.raw_reference,
+    field.resolved_column,
+    ...(Array.isArray(field.candidate_columns) ? field.candidate_columns : []),
+    field.name,
+    field.column,
+    field.target,
+    field.source,
+    field.label,
+  ];
+  return candidates.map((value) => String(value || "").trim()).find(Boolean) || "";
+}
+
+function formatFieldLabel(field) {
+  if (!field || typeof field !== "object") return "Unresolved field";
+  return (
+    String(field.raw_reference || "").trim()
+    || String(field.resolved_column || "").trim()
+    || String(field.name || "").trim()
+    || String(field.column || "").trim()
+    || String(field.target || "").trim()
+    || String(field.source || "").trim()
+    || String(field.label || "").trim()
+    || "Unresolved field"
+  );
+}
+
+function formatActionKindLabel(kind) {
+  const normalized = String(kind || "").trim();
+  if (normalized === "project_columns") return "project columns";
+  if (normalized === "drop_columns") return "drop columns";
+  if (normalized === "filter_rows") return "filter rows";
+  if (normalized === "sort_rows") return "sort rows";
+  if (normalized === "rename_columns") return "rename columns";
+  if (normalized === "visualize") return "visualize";
+  return normalized || "clarification";
+}
+
+function formatColumnLabel(column) {
+  if (typeof column === "string") return column.trim();
+  if (!column || typeof column !== "object") return "";
+  return (
+    String(column.name || "").trim()
+    || String(column.normalized_name || "").trim()
+    || String(column.label || "").trim()
+    || String(column.source || "").trim()
+    || String(column.field || "").trim()
+    || String(column.value || "").trim()
+    || String(column.column || "").trim()
+  );
 }

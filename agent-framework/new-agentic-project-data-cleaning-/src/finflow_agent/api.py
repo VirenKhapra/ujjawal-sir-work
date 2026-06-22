@@ -15,6 +15,11 @@ from arq import create_pool
 from arq.connections import RedisSettings
 from finflow_agent.jobs.repository import JobRepository
 from finflow_agent.storage.file_store import FileStore
+from finflow_agent.llm_telemetry import (
+    log_runtime_event,
+    reset_runtime_context,
+    set_runtime_context,
+)
 from finflow_agent.planning.canonical_intent import CanonicalIntentEnvelope
 from finflow_agent.planning.canonical_intent import compute_intent_hash, upcast_canonical_intent_payload
 from finflow_agent.planning.compiler import compile_canonical_intent
@@ -41,6 +46,8 @@ class JobPayload(BaseModel):
     file_id: str
     file_name: str
     resolved_file_path: str | None = None
+    data_profile_id: str | None = None
+    canonical_intent_revision_id: str | None = None
     canonical_intent: CanonicalIntentEnvelope | None = None
     output_format: str
     audit_context: dict[str, Any] | None = None
@@ -93,81 +100,119 @@ async def process_job_task(ctx, payload_dict: dict):
 
     submission_id = payload.submission_id
     job_id = f"agent:{submission_id}"
+    runtime_token = set_runtime_context(
+        submission_id=submission_id,
+        job_id=job_id,
+        trigger="worker",
+        canonical_intent_present=payload.canonical_intent is not None,
+        instruction_present=bool((payload.audit_context or {}).get("original_instruction")),
+        legacy_schema_state_present=False,
+    )
     
     repository = (ctx or {}).get("repository") or JobRepository()
     await repository.mark_planning(job_id)
+    log_runtime_event(
+        "worker_entry_entered",
+        trigger="worker",
+        instruction_present=bool((payload.audit_context or {}).get("original_instruction")),
+        canonical_intent_present=payload.canonical_intent is not None,
+        legacy_schema_state_present=False,
+    )
     
-    # Resolve the file path from the canonical transport payload first.
     try:
-        if payload.resolved_file_path:
-            resolved_path = Path(payload.resolved_file_path)
-            if not resolved_path.exists():
-                raise FileNotFoundError(f"Resolved file path does not exist: {resolved_path}")
-        else:
-            store = (ctx or {}).get("file_store") or FileStore()
-            resolved_path = store.resolve_uploaded_file(payload.file_id)
-        resolved_file_path = str(resolved_path)
-    except Exception as e:
-        reason = f"File store resolution failed: {str(e)}"
-        await repository.mark_quarantined(job_id, reason)
-        result_payload = {
-            "submission_id": submission_id,
-            "status": "quarantined",
-            "output_path": None,
-            "summary": {"reason": reason}
-        }
-        _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
-        from finflow_agent.jobs.callbacks import send_backend_callback
-        await send_backend_callback(result_payload, job_id, repository)
-        return
-
-    # Build plan
-    from uuid import uuid4
-    file_prefix = f"submission_{submission_id}_{uuid4().hex[:8]}"
-
-    plan_or_dict = None
-    if payload.canonical_intent is not None:
+        # Resolve the file path from the canonical transport payload first.
         try:
-            canonical_payload = upcast_canonical_intent_payload(payload.canonical_intent.model_dump(mode="json"))
-            if canonical_payload is None:
-                raise ValueError("Canonical intent payload is missing")
-            payload.canonical_intent = CanonicalIntentEnvelope.model_validate(canonical_payload)
-            logger.info(
-                "event=canonical_job_started job_id=%s submission_id=%s intent_schema_version=%s",
-                job_id,
-                submission_id,
-                payload.canonical_intent.intent.schema_version,
-            )
-            plan_or_dict = compile_canonical_intent(
-                payload.canonical_intent.intent,
-                resolved_file_path=resolved_file_path,
-                file_type=Path(resolved_file_path).suffix.lstrip(".").lower(),
-                output_dir=os.environ.get("OUTPUT_DIR", "outputs"),
-                artifact_prefix=file_prefix,
-            )
-            if isinstance(plan_or_dict, dict):
-                plan_or_dict.setdefault("plan_metadata", {})
-                plan_or_dict["plan_metadata"].update(
-                    {
-                        "intent_id": payload.canonical_intent.intent_id,
-                        "intent_revision": payload.canonical_intent.intent_revision,
-                        "intent_hash": payload.canonical_intent.intent_hash or compute_intent_hash(payload.canonical_intent.intent),
-                        "compiler_version": "1.0",
-                    }
+            if payload.resolved_file_path:
+                resolved_path = Path(payload.resolved_file_path)
+                if not resolved_path.exists():
+                    raise FileNotFoundError(f"Resolved file path does not exist: {resolved_path}")
+            else:
+                store = (ctx or {}).get("file_store") or FileStore()
+                resolved_path = store.resolve_uploaded_file(payload.file_id)
+            resolved_file_path = str(resolved_path)
+        except Exception as e:
+            reason = f"File store resolution failed: {str(e)}"
+            await repository.mark_quarantined(job_id, reason)
+            result_payload = {
+                "submission_id": submission_id,
+                "status": "quarantined",
+                "output_path": None,
+                "summary": {"reason": reason}
+            }
+            _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
+            from finflow_agent.jobs.callbacks import send_backend_callback
+            await send_backend_callback(result_payload, job_id, repository)
+            return
+
+        # Build plan
+        from uuid import uuid4
+        file_prefix = f"submission_{submission_id}_{uuid4().hex[:8]}"
+
+        plan_or_dict = None
+        if payload.canonical_intent is not None:
+            try:
+                canonical_payload = upcast_canonical_intent_payload(payload.canonical_intent.model_dump(mode="json"))
+                if canonical_payload is None:
+                    raise ValueError("Canonical intent payload is missing")
+                payload.canonical_intent = CanonicalIntentEnvelope.model_validate(canonical_payload)
+                logger.info(
+                    "event=canonical_job_started job_id=%s submission_id=%s intent_schema_version=%s",
+                    job_id,
+                    submission_id,
+                    payload.canonical_intent.intent.schema_version,
                 )
-            logger.info(
-                "event=canonical_job_compiled job_id=%s submission_id=%s",
-                job_id,
-                submission_id,
-            )
-        except Exception as exc:
-            # Extract user-friendly reason from canonical intent evidence if available
-            reason = f"Canonical intent compilation failed: {exc}"
-            if payload.canonical_intent and payload.canonical_intent.intent:
-                intent_evidence = getattr(payload.canonical_intent.intent, 'evidence', [])
-                intent_status = getattr(payload.canonical_intent.intent, 'resolution_status', '')
-                if intent_status == "needs_clarification" and intent_evidence:
-                    reason = "; ".join(str(e) for e in intent_evidence)
+                log_runtime_event(
+                    "canonical_compiler_entered",
+                    trigger="worker",
+                    instruction_present=bool((payload.audit_context or {}).get("original_instruction")),
+                    canonical_intent_present=True,
+                    legacy_schema_state_present=False,
+                    prompt_text=str((payload.audit_context or {}).get("original_instruction", "")),
+                    canonical_intent_schema_version=payload.canonical_intent.intent.schema_version,
+                )
+                plan_or_dict = compile_canonical_intent(
+                    payload.canonical_intent.intent,
+                    resolved_file_path=resolved_file_path,
+                    file_type=Path(resolved_file_path).suffix.lstrip(".").lower(),
+                    output_dir=os.environ.get("OUTPUT_DIR", "outputs"),
+                    artifact_prefix=file_prefix,
+                )
+                if isinstance(plan_or_dict, dict):
+                    plan_or_dict.setdefault("plan_metadata", {})
+                    plan_or_dict["plan_metadata"].update(
+                        {
+                            "intent_id": payload.canonical_intent.intent_id,
+                            "intent_revision": payload.canonical_intent.intent_revision,
+                            "intent_hash": payload.canonical_intent.intent_hash or compute_intent_hash(payload.canonical_intent.intent),
+                            "compiler_version": "1.0",
+                        }
+                    )
+                logger.info(
+                    "event=canonical_job_compiled job_id=%s submission_id=%s",
+                    job_id,
+                    submission_id,
+                )
+            except Exception as exc:
+                # Extract user-friendly reason from canonical intent evidence if available
+                reason = f"Canonical intent compilation failed: {exc}"
+                if payload.canonical_intent and payload.canonical_intent.intent:
+                    intent_evidence = getattr(payload.canonical_intent.intent, 'evidence', [])
+                    intent_status = getattr(payload.canonical_intent.intent, 'resolution_status', '')
+                    if intent_status == "needs_clarification" and intent_evidence:
+                        reason = "; ".join(str(e) for e in intent_evidence)
+                await repository.mark_quarantined(job_id, reason)
+                result_payload = {
+                    "submission_id": submission_id,
+                    "status": "quarantined",
+                    "output_path": None,
+                    "summary": {"reason": reason},
+                }
+                _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
+                from finflow_agent.jobs.callbacks import send_backend_callback
+                await send_backend_callback(result_payload, job_id, repository)
+                return
+        else:
+            reason = "legacy_payload_not_supported: canonical_intent is required for execution."
             await repository.mark_quarantined(job_id, reason)
             result_payload = {
                 "submission_id": submission_id,
@@ -179,105 +224,92 @@ async def process_job_task(ctx, payload_dict: dict):
             from finflow_agent.jobs.callbacks import send_backend_callback
             await send_backend_callback(result_payload, job_id, repository)
             return
-    else:
-        reason = "legacy_payload_not_supported: canonical_intent is required for execution."
-        await repository.mark_quarantined(job_id, reason)
-        result_payload = {
-            "submission_id": submission_id,
-            "status": "quarantined",
-            "output_path": None,
-            "summary": {"reason": reason},
-        }
-        _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
-        from finflow_agent.jobs.callbacks import send_backend_callback
-        await send_backend_callback(result_payload, job_id, repository)
-        return
 
-    
-    if isinstance(plan_or_dict, dict) and plan_or_dict.get("status") == "quarantined":
-        reason = plan_or_dict.get("reason") or "Request quarantined by canonical planner."
-        logger.info(
-            "Agent job planning quarantined job_id=%s submission_id=%s reason=%s",
-            job_id,
-            submission_id,
-            reason,
-        )
-        await repository.mark_quarantined(job_id, reason)
-        result_payload = {
-            "submission_id": submission_id,
-            "status": "quarantined",
-            "output_path": None,
-            "summary": {"reason": reason}
-        }
-        _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
-        from finflow_agent.jobs.callbacks import send_backend_callback
-        await send_backend_callback(result_payload, job_id, repository)
-        return
-        
-    try:
-        await repository.mark_running(job_id)
-        logger.info(
-            "Agent job execution started job_id=%s submission_id=%s",
-            job_id,
-            submission_id,
-        )
-        
-        engine = ExecutionEngine()
-        result_payload = engine.execute(
-            plan_or_dict,
-            submission_id=submission_id,
-        )
-        _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
-        
-        if result_payload.get("status") != "complete":
-            failure_reason = _extract_failure_reason(result_payload)
-            await repository.mark_failed(
+        if isinstance(plan_or_dict, dict) and plan_or_dict.get("status") == "quarantined":
+            reason = plan_or_dict.get("reason") or "Request quarantined by canonical planner."
+            logger.info(
+                "Agent job planning quarantined job_id=%s submission_id=%s reason=%s",
                 job_id,
-                failure_reason,
+                submission_id,
+                reason,
             )
-        else:
-            output_path = result_payload.get("output_path")
-            if not output_path:
-                result_payload = {
-                    "submission_id": submission_id,
-                    "status": "failed",
-                    "output_path": None,
-                    "summary": {
-                        "error": (
-                            "Execution completed but reporting output was missing "
-                            "primary output_path."
-                        ),
-                        "error_message": (
-                            "Execution completed but reporting output was missing "
-                            "primary output_path."
-                        ),
-                        "engine_result": result_payload
-                    }
-                }
-                _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
+            await repository.mark_quarantined(job_id, reason)
+            result_payload = {
+                "submission_id": submission_id,
+                "status": "quarantined",
+                "output_path": None,
+                "summary": {"reason": reason}
+            }
+            _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
+            from finflow_agent.jobs.callbacks import send_backend_callback
+            await send_backend_callback(result_payload, job_id, repository)
+            return
+
+        try:
+            await repository.mark_running(job_id)
+            logger.info(
+                "Agent job execution started job_id=%s submission_id=%s",
+                job_id,
+                submission_id,
+            )
+
+            engine = ExecutionEngine()
+            result_payload = engine.execute(
+                plan_or_dict,
+                submission_id=submission_id,
+            )
+            _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
+
+            if result_payload.get("status") != "complete":
+                failure_reason = _extract_failure_reason(result_payload)
                 await repository.mark_failed(
                     job_id,
-                    "Execution completed but reporting output was missing primary output_path.",
+                    failure_reason,
                 )
             else:
-                await repository.mark_succeeded(job_id, result_payload)
-    except Exception as e:
-        error_message = f"Unhandled worker exception while processing job: {e}"
-        await repository.mark_failed(job_id, error_message)
-        result_payload = {
-            "submission_id": submission_id,
-            "status": "failed",
-            "output_path": None,
-            "summary": {
-                "error": error_message,
-                "error_message": error_message,
+                output_path = result_payload.get("output_path")
+                if not output_path:
+                    result_payload = {
+                        "submission_id": submission_id,
+                        "status": "failed",
+                        "output_path": None,
+                        "summary": {
+                            "error": (
+                                "Execution completed but reporting output was missing "
+                                "primary output_path."
+                            ),
+                            "error_message": (
+                                "Execution completed but reporting output was missing "
+                                "primary output_path."
+                            ),
+                            "engine_result": result_payload
+                        }
+                    }
+                    _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
+                    await repository.mark_failed(
+                        job_id,
+                        "Execution completed but reporting output was missing primary output_path.",
+                    )
+                else:
+                    await repository.mark_succeeded(job_id, result_payload)
+        except Exception as e:
+            error_message = f"Unhandled worker exception while processing job: {e}"
+            await repository.mark_failed(job_id, error_message)
+            result_payload = {
+                "submission_id": submission_id,
+                "status": "failed",
+                "output_path": None,
+                "summary": {
+                    "error": error_message,
+                    "error_message": error_message,
+                }
             }
-        }
-        _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
+            _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
 
-        
-    from finflow_agent.jobs.callbacks import send_backend_callback
-    await send_backend_callback(result_payload, job_id, repository)
+        from finflow_agent.jobs.callbacks import send_backend_callback
+        await send_backend_callback(result_payload, job_id, repository)
+    finally:
+        reset_runtime_context(runtime_token)
 
 # ARQ worker settings
 async def worker_startup(ctx):

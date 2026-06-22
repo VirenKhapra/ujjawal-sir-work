@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models import DataProfile, Submission
 from app.services.json_safety import make_json_safe
-from app.services.action_schema import action_schema_to_constraints
-from app.services.canonical_intent import build_capability_snapshot, build_canonical_intent, canonical_intent_to_legacy_action_schema
-from app.services.rule_engine import build_validation_warnings
 from app.services.semantic_schema import canonical_target_for_column
-from app.services.rule_types import SEMANTIC_HINTS
 
+PROFILER_VERSION = "1.0"
+MAX_SAMPLE_VALUES = 3
+MAX_DISTINCT_TRACK = 25
 
 COLUMN_ALIASES = {
     "date": "voucher_date",
@@ -33,28 +36,23 @@ COLUMN_ALIASES = {
     "account code": "account_code",
 }
 
-def build_schema_proposal_from_file(
+
+def compute_file_fingerprint(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_data_profile_from_file(
     path: Path,
     *,
     max_preview_rows: int,
-    instruction: str = "",
 ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
-    # --- Telemetry: log build_schema_proposal_called ---
-    try:
-        import json as _json
-        import logging as _logging
-        from datetime import datetime, timezone
-        _telem_logger = _logging.getLogger("llm_telemetry")
-        _telem_logger.info(_json.dumps({
-            "event": "build_schema_proposal_called",
-            "submission_instruction": (instruction or "")[:50],
-            "source": "poll_fallback",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }))
-    except Exception:
-        pass
-    # --- End telemetry ---
-
     extension = path.suffix.lower()
     if extension in {".csv", ".tsv", ".xlsx", ".xls"}:
         frame, total_rows = _load_tabular_preview(path, extension, max_preview_rows=max_preview_rows)
@@ -70,57 +68,107 @@ def build_schema_proposal_from_file(
 
     frame = frame.astype(object).where(pd.notnull(frame), None)
     detected_types = _infer_detected_types(frame)
-    records = _records_from_frame(frame)
+    preview_rows = _records_from_frame(frame)
     source_columns = [str(column) for column in frame.columns]
-    proposed_fields = [_build_field_mapping(column, detected_types.get(str(column), "string")) for column in source_columns]
-    canonical_intent = build_canonical_intent(
-        source_columns,
-        records,
-        instruction,
-        output_format="xlsx",
-        detected_types=detected_types,
-        capability_snapshot=build_capability_snapshot(),
-    )
-    canonical_constraints = action_schema_to_constraints(
-        canonical_intent_to_legacy_action_schema(
-            canonical_intent
-        )
-    )
-    validation_warnings = build_validation_warnings(frame, canonical_constraints)
-    legacy_action_schema = canonical_intent_to_legacy_action_schema(canonical_intent)
+    fingerprint = compute_file_fingerprint(path)
 
-    proposal = {
-        "status": "awaiting_schema_approval",
-        "requires_user_approval": True,
-        "schema_kind": "tabular",
-        "original_prompt": instruction,
-        "normalized_prompt": canonical_intent.get("normalized_prompt", ""),
+    profile = {
+        "file_fingerprint": fingerprint,
+        "profiler_version": PROFILER_VERSION,
+        "profile_status": "ready",
+        "row_count": total_rows,
+        "preview_row_count": len(preview_rows),
         "source_columns": source_columns,
-        "proposed_fields": proposed_fields,
         "detected_types": detected_types,
-        "preview_rows": records,
-        "preview_row_count": len(records),
-        "total_rows": total_rows,
-        "canonical_intent": canonical_intent,
-        "intent_validation": {
-            "status": canonical_intent.get("resolution_status", "needs_clarification"),
-            "decision": canonical_intent.get("decision", ""),
-            "evidence": canonical_intent.get("evidence", []),
-            "alternatives_considered": canonical_intent.get("alternatives_considered", []),
-            "repair_notes": canonical_intent.get("repair_notes", []),
-            "assumptions": canonical_intent.get("assumptions", []),
-        },
-        "action_schema": {
-            **legacy_action_schema,
-            "optional_hints": {"source": "deferred_to_agent_parser", "canonical_intent_version": canonical_intent.get("schema_version", "2.0")},
-            "source": "deferred_to_agent_parser",
-        },
-        "suggested_constraints": canonical_constraints,
-        "validation_warnings": validation_warnings,
-        "suggestion": _build_suggestion(validation_warnings),
+        "preview_rows": preview_rows,
+        "columns": [_column_profile(frame, str(column), detected_types.get(str(column), "string")) for column in frame.columns],
     }
-    safe_proposal = make_json_safe(proposal)
-    return safe_proposal, safe_proposal.get("preview_rows", [])
+    safe_profile = make_json_safe(profile)
+    return safe_profile, safe_profile.get("preview_rows", [])
+
+
+async def load_latest_data_profile(db: AsyncSession, submission_id) -> DataProfile | None:
+    stmt = (
+        select(DataProfile)
+        .where(DataProfile.submission_id == submission_id)
+        .order_by(DataProfile.created_at.desc())
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalars().first()
+
+
+async def get_or_create_data_profile(
+    db: AsyncSession,
+    *,
+    submission: Submission,
+    path: Path,
+    max_preview_rows: int,
+) -> tuple[DataProfile | None, dict[str, Any], list[dict[str, Any]]]:
+    built = build_data_profile_from_file(path, max_preview_rows=max_preview_rows)
+    if built is None:
+        return None, {}, []
+    profile_payload, preview_rows = built
+    fingerprint = str(profile_payload.get("file_fingerprint", "")).strip()
+    profiler_version = str(profile_payload.get("profiler_version", PROFILER_VERSION)).strip() or PROFILER_VERSION
+
+    existing_stmt = (
+        select(DataProfile)
+        .where(
+            DataProfile.submission_id == submission.id,
+            DataProfile.file_fingerprint == fingerprint,
+            DataProfile.profiler_version == profiler_version,
+        )
+        .limit(1)
+    )
+    existing = (await db.execute(existing_stmt)).scalars().first()
+    if existing is not None:
+        return existing, make_json_safe(existing.profile_json), preview_rows
+
+    record = DataProfile(
+        submission_id=submission.id,
+        file_fingerprint=fingerprint,
+        profiler_version=profiler_version,
+        profile_json=profile_payload,
+        status=str(profile_payload.get("profile_status", "ready")),
+    )
+    db.add(record)
+    await db.flush()
+    return record, profile_payload, preview_rows
+
+
+def _column_profile(frame: pd.DataFrame, column: str, detected_type: str) -> dict[str, Any]:
+    series = frame[column]
+    non_null = series.dropna()
+    distinct_values = list(dict.fromkeys(str(value) for value in non_null.tolist() if value not in {None, ""}))
+    bounded_distinct = distinct_values[:MAX_DISTINCT_TRACK]
+    min_value = None
+    max_value = None
+    try:
+        numeric_series = pd.to_numeric(non_null, errors="coerce").dropna()
+        if not numeric_series.empty:
+            min_value = numeric_series.min()
+            max_value = numeric_series.max()
+        elif not non_null.empty:
+            comparable = [str(value) for value in non_null.tolist()]
+            min_value = min(comparable)
+            max_value = max(comparable)
+    except Exception:
+        min_value = None
+        max_value = None
+
+    return {
+        "name": column,
+        "normalized_name": _normalize_source_column(column),
+        "physical_dtype": str(series.dtype),
+        "semantic_type_hint": canonical_target_for_column(column),
+        "nullable": bool(series.isna().any()),
+        "null_count": int(series.isna().sum()),
+        "distinct_count": len(distinct_values),
+        "sample_values": bounded_distinct[:MAX_SAMPLE_VALUES],
+        "min_value": min_value,
+        "max_value": max_value,
+        "detected_type": detected_type,
+    }
 
 
 def _load_tabular_preview(path: Path, extension: str, *, max_preview_rows: int) -> tuple[pd.DataFrame | None, int]:
@@ -136,7 +184,6 @@ def _load_tabular_preview(path: Path, extension: str, *, max_preview_rows: int) 
         total_rows = _estimate_excel_rows(path, extension)
         if total_rows <= 0:
             total_rows = len(frame)
-
     frame = frame.dropna(how="all")
     frame.columns = [_normalize_source_column(column) for column in frame.columns]
     if total_rows <= 0:
@@ -171,9 +218,7 @@ def _load_text_frame(path: Path, *, max_preview_rows: int) -> tuple[pd.DataFrame
         return None, 0
     total_rows = len(lines)
     preview_lines = lines[:max_preview_rows]
-    return pd.DataFrame(
-        [{"line_number": index + 1, "raw_text": line} for index, line in enumerate(preview_lines)]
-    ), total_rows
+    return pd.DataFrame([{"line_number": index + 1, "raw_text": line} for index, line in enumerate(preview_lines)]), total_rows
 
 
 def _normalize_source_column(value: Any) -> str:
@@ -196,13 +241,7 @@ def _infer_detected_types(frame: pd.DataFrame) -> dict[str, str]:
             detected[str(column)] = "number"
             continue
         numeric_ratio = pd.to_numeric(series, errors="coerce").notna().mean()
-        if numeric_ratio >= 0.9:
-            detected[str(column)] = "number"
-            continue
-        if _looks_like_date_column(str(column), series):
-            detected[str(column)] = "date"
-        else:
-            detected[str(column)] = "string"
+        detected[str(column)] = "number" if numeric_ratio >= 0.9 else "string"
     return detected
 
 
@@ -258,24 +297,3 @@ def _estimate_excel_rows(path: Path, extension: str) -> int:
         return len(frame)
     except Exception:
         return 0
-
-
-def _looks_like_date_column(column_name: str, series: pd.Series) -> bool:
-    normalized_name = _tokenize_name(column_name)
-    if normalized_name in SEMANTIC_HINTS["date_like"] or "date" in normalized_name:
-        return True
-    sample = series.astype(str).head(10)
-    date_pattern_hits = sample.str.contains(r"\d{1,4}[-/]\d{1,2}[-/]\d{1,4}", regex=True).mean()
-    return date_pattern_hits >= 0.6
-
-
-
-
-def _build_suggestion(validation_warnings: list[dict[str, Any]]) -> str:
-    if validation_warnings:
-        return "Review the proposed schema and the flagged validation warnings before agent processing begins."
-    return "Review the detected schema mapping and approve it before agent processing begins."
-
-
-def _tokenize_name(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")

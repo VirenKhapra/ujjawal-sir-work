@@ -140,8 +140,26 @@ class Submission(Base):
     review: Mapped["Review | None"] = relationship(back_populates="submission", cascade="all, delete-orphan")
     structured_records: Mapped[list["SubmissionRecord"]] = relationship(back_populates="submission", cascade="all, delete-orphan")
     comments: Mapped[list["SubmissionComment"]] = relationship(back_populates="submission", cascade="all, delete-orphan")
+    data_profiles: Mapped[list["DataProfile"]] = relationship(back_populates="submission", cascade="all, delete-orphan")
     intent_revisions: Mapped[list["CanonicalIntentRevision"]] = relationship(back_populates="submission", cascade="all, delete-orphan")
     intent_outbox_events: Mapped[list["IntentDispatchOutbox"]] = relationship(back_populates="submission", cascade="all, delete-orphan")
+
+
+class DataProfile(Base):
+    __tablename__ = "data_profiles"
+    __table_args__ = (
+        UniqueConstraint("submission_id", "file_fingerprint", "profiler_version", name="uq_data_profiles_submission_fingerprint"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    submission_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("submissions.id", ondelete="CASCADE"), nullable=False)
+    file_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    profiler_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    profile_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ready")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    submission: Mapped["Submission"] = relationship(back_populates="data_profiles")
 
 
 class CanonicalIntentRevision(Base):

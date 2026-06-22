@@ -3,8 +3,9 @@ import { api } from "./client.js";
 export function mapWorkflowStatus(status) {
   const normalized = String(status || "").trim().toLowerCase();
   if (normalized === "awaiting_clarification") return "clarification";
+  if (normalized === "awaiting_confirmation") return "clarification";
   if (["pending", "queued", "planning", "running"].includes(normalized)) return "running";
-  if (["awaiting_schema_approval", "awaiting_confirmation"].includes(normalized)) return "schema_review";
+  if (normalized === "awaiting_schema_approval") return "clarification";
   if (normalized === "quarantined") return "quarantined";
   if (["succeeded", "complete"].includes(normalized)) return "complete";
   if (["failed", "callback_failed", "declined"].includes(normalized)) return "failed";
@@ -64,17 +65,10 @@ function buildSummarySteps(status, workflowStatus) {
       { name: "Output", status: "blocked" },
     ];
   }
-  if (workflowStatus === "schema_review") {
-    return [
-      { name: "Ingestion", status: "complete" },
-      { name: "Schema approval", status: "blocked" },
-      { name: "Output", status: "blocked" },
-    ];
-  }
   if (workflowStatus === "clarification") {
     return [
       { name: "Ingestion", status: "complete" },
-      { name: "Clarification", status: "blocked" },
+      { name: "Interpretation review", status: "blocked" },
       { name: "Output", status: "blocked" },
     ];
   }
@@ -132,6 +126,10 @@ export function mapJobDetail(detail) {
   const completedAt = detail.completed_at || (isCompletedWorkflowStatus(detail.status) ? detail.submitted_at : null);
   const workflowStatus = deriveWorkflowStatus(detail);
   const summary = detail.summary || {};
+  const dataProfile = detail.data_profile || {};
+  const canonicalIntent = detail.canonical_intent || {};
+  const clarification = detail.clarification || null;
+  const execution = detail.execution || null;
   return {
     id: formatDisplayJobId(detail.sub_id, detail.id),
     backendId: detail.id,
@@ -160,7 +158,14 @@ export function mapJobDetail(detail) {
     detectedTypes: detail.detected_types || {},
     validation: detail.validation || {},
     previewRows: Array.isArray(detail.preview_rows) ? detail.preview_rows : [],
-    schemaProposal: detail.schema_proposal || {},
+    dataProfile,
+    profileStatus: detail.profile_status || "",
+    canonicalIntent,
+    intentStatus: detail.intent_status || "",
+    clarification,
+    execution,
+    repairAvailable: Boolean(detail.repair_available),
+    extractionPreview: clarification?.extraction_preview || null,
     previewToken: detail.preview_token || "",
   };
 }
@@ -281,13 +286,21 @@ export async function fetchClarificationStatus(submissionId) {
   return response.data;
 }
 
-export async function approveSchemaProposal(jobId) {
-  const response = await api.post(`/uploads/${jobId}/schema-approve`);
+export async function confirmInterpretation(jobId, reason = null) {
+  const response = await api.post(`/uploads/${jobId}/confirm-interpretation`, { reason });
   return response.data;
 }
 
-export async function declineSchemaProposal(jobId) {
-  const response = await api.post(`/uploads/${jobId}/schema-decline`);
+export async function rejectInterpretation(jobId, reason = null) {
+  const response = await api.post(`/uploads/${jobId}/reject-interpretation`, { reason });
+  return response.data;
+}
+
+export async function replaceColumnMapping(jobId, mapping, reason = null) {
+  const response = await api.post(`/uploads/${jobId}/replace-column-mapping`, {
+    mapping,
+    reason,
+  });
   return response.data;
 }
 

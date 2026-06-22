@@ -413,7 +413,20 @@ def _try_llm_column_resolution(
         # --- Telemetry: log call start ---
         _telemetry_ctx = None
         try:
-            from finflow_agent.llm_telemetry import log_llm_started, log_llm_completed, log_llm_failed
+            from finflow_agent.llm_telemetry import log_llm_started, log_llm_completed, log_llm_failed, log_runtime_event
+            log_runtime_event(
+                "column_grounding_llm_entered",
+                service="agent-service",
+                trigger="worker",
+                instruction_present=False,
+                canonical_intent_present=True,
+                legacy_schema_state_present=False,
+                prompt_text=prompt_text,
+                model="llama-3.3-70b-versatile",
+                api_key=os.environ.get("GROQ_API_KEY", ""),
+                api_key_source="GROQ_API_KEY",
+                requested_field=requested_field,
+            )
             _telemetry_ctx = log_llm_started(
                 service="agent-service",
                 operation="column_resolution",

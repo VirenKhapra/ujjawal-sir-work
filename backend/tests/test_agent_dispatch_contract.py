@@ -79,6 +79,29 @@ def _agent_service_job_payload_fields() -> list[str]:
     raise AssertionError("JobPayload class was not found in the agent service API")
 
 
+def _resolved_canonical_intent() -> dict:
+    return {
+        "schema_version": "2.0",
+        "intent_id": "intent-1",
+        "intent_revision": 1,
+        "intent_hash": "hash-1",
+        "parent_intent_id": None,
+        "original_prompt": "clean this",
+        "normalized_prompt": "clean this",
+        "resolution_status": "resolved",
+        "decision": "clean",
+        "evidence": [],
+        "alternatives_considered": [],
+        "actions": [{"kind": "clean", "mode": "safe_default", "operations": []}],
+        "output_format": "xlsx",
+        "assumptions": [],
+        "repair_notes": [],
+        "dataframe_profile": {"source_columns": ["a", "b"]},
+        "capability_version": "backend.capability.1",
+        "capability_snapshot": {},
+    }
+
+
 def test_agent_dispatcher_sends_file_id_not_file_path(monkeypatch):
     async def run() -> tuple[str, dict, bool, str, str]:
         with tempfile.TemporaryDirectory(dir=_repo_root()) as temp_dir:
@@ -99,15 +122,26 @@ def test_agent_dispatcher_sends_file_id_not_file_path(monkeypatch):
                 version_number=1,
                 status=SubmissionStatus.queued,
             )
+            submission.canonical_intent = _resolved_canonical_intent()
 
             fake_redis = FakeRedis()
             fake_db = FakeDbSession(submission)
+            data_profile = type("Profile", (), {"id": uuid4()})()
+            revision_record = type("Revision", (), {"id": uuid4(), "created_at": None, "canonical_intent": submission.canonical_intent})()
 
             async def fake_create_pool(*_args, **_kwargs):
                 return fake_redis
 
+            async def fake_load_profile(*_args, **_kwargs):
+                return data_profile
+
+            async def fake_latest_revision(*_args, **_kwargs):
+                return revision_record
+
             monkeypatch.setattr(agent_dispatcher, "create_pool", fake_create_pool)
             monkeypatch.setattr(agent_dispatcher, "AsyncSessionLocal", lambda: FakeSessionManager(fake_db))
+            monkeypatch.setattr(agent_dispatcher, "load_latest_data_profile", fake_load_profile)
+            monkeypatch.setattr(agent_dispatcher, "latest_intent_revision_for_submission", fake_latest_revision)
             monkeypatch.setattr(
                 agent_dispatcher,
                 "get_settings",
@@ -157,15 +191,26 @@ def test_agent_payload_matches_agent_service_job_payload(monkeypatch):
                 version_number=1,
                 status=SubmissionStatus.queued,
             )
+            submission.canonical_intent = _resolved_canonical_intent()
 
             fake_redis = FakeRedis()
             fake_db = FakeDbSession(submission)
+            data_profile = type("Profile", (), {"id": uuid4()})()
+            revision_record = type("Revision", (), {"id": uuid4(), "created_at": None, "canonical_intent": submission.canonical_intent})()
 
             async def fake_create_pool(*_args, **_kwargs):
                 return fake_redis
 
+            async def fake_load_profile(*_args, **_kwargs):
+                return data_profile
+
+            async def fake_latest_revision(*_args, **_kwargs):
+                return revision_record
+
             monkeypatch.setattr(agent_dispatcher, "create_pool", fake_create_pool)
             monkeypatch.setattr(agent_dispatcher, "AsyncSessionLocal", lambda: FakeSessionManager(fake_db))
+            monkeypatch.setattr(agent_dispatcher, "load_latest_data_profile", fake_load_profile)
+            monkeypatch.setattr(agent_dispatcher, "latest_intent_revision_for_submission", fake_latest_revision)
             monkeypatch.setattr(
                 agent_dispatcher,
                 "get_settings",
@@ -188,6 +233,8 @@ def test_agent_payload_matches_agent_service_job_payload(monkeypatch):
         "file_id",
         "file_name",
         "resolved_file_path",
+        "data_profile_id",
+        "canonical_intent_revision_id",
         "canonical_intent",
         "output_format",
         "audit_context",
@@ -201,3 +248,57 @@ def test_shared_upload_dir_contract_documented():
     assert compose_text.count("UPLOAD_DIR: /app/storage/uploads") >= 2
     assert "backend_storage:/app/storage" in compose_text
     assert "UPLOAD_DIR=/app/storage/uploads" in deploy_text
+
+
+def test_dispatch_requires_persisted_data_profile_when_missing(monkeypatch):
+    async def run() -> dict:
+        with tempfile.TemporaryDirectory(dir=_repo_root()) as temp_dir:
+            upload_dir = Path(temp_dir) / "uploads"
+            upload_dir.mkdir()
+            stored_file = upload_dir / "stored-input.csv"
+            stored_file.write_text("a,b\n1,2\n", encoding="utf-8")
+
+            submission = Submission(
+                id=uuid4(),
+                file_name="original-input.csv",
+                file_path=str(stored_file),
+                file_size_bytes=10,
+                original_filename="original-input.csv",
+                instruction="clean this",
+                output_format="XLSX",
+                user_id=uuid4(),
+                version_number=1,
+                status=SubmissionStatus.queued,
+            )
+            submission.summary = {}
+
+            fake_redis = FakeRedis()
+            fake_db = FakeDbSession(submission)
+
+            async def fake_create_pool(*_args, **_kwargs):
+                return fake_redis
+
+            async def fake_load_profile(*_args, **_kwargs):
+                return None
+
+            async def fake_latest_revision(*_args, **_kwargs):
+                return None
+
+            monkeypatch.setattr(agent_dispatcher, "create_pool", fake_create_pool)
+            monkeypatch.setattr(agent_dispatcher, "AsyncSessionLocal", lambda: FakeSessionManager(fake_db))
+            monkeypatch.setattr(agent_dispatcher, "load_latest_data_profile", fake_load_profile)
+            monkeypatch.setattr(agent_dispatcher, "latest_intent_revision_for_submission", fake_latest_revision)
+            monkeypatch.setattr(
+                agent_dispatcher,
+                "get_settings",
+                lambda: type("Settings", (), {"redis_url": "redis://localhost:6379/0", "max_preview_rows": 50})(),
+            )
+
+            await agent_dispatcher.enqueue_submission_dispatch(submission.id)
+            return {"jobs": fake_redis.jobs, "status": submission.status.value, "summary": submission.summary}
+
+    result = asyncio.run(run())
+
+    assert result["jobs"] == []
+    assert result["status"] == SubmissionStatus.failed.value
+    assert result["summary"]["error"] == "data_profile_missing"

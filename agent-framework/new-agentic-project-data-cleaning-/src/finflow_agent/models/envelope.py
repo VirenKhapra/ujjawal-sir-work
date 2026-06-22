@@ -79,7 +79,7 @@ class IntentEnvelope(BaseModel):
     Requirements: 4.4 - patch application produces new revision via envelope
     """
 
-    model_config = ConfigDict(strict=True)
+    model_config = ConfigDict(strict=True, populate_by_name=True)
 
     submission_id: str
     pipeline_status: PipelineStatus
@@ -90,7 +90,7 @@ class IntentEnvelope(BaseModel):
     canonical: Any = None  # CanonicalIntent (forward ref, resolved at runtime)
 
     # Metadata
-    model_version: str
+    pipeline_model_version: str = Field(alias="model_version")
     feature_flags: dict[str, bool]
     created_at: datetime
     updated_at: datetime

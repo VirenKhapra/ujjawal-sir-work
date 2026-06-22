@@ -27,6 +27,11 @@ class FakeExecuteResult:
     def scalars(self):
         return self
 
+    def first(self):
+        if isinstance(self._rows, list):
+            return self._rows[0] if self._rows else None
+        return self._rows
+
     def all(self):
         return self._rows
 
@@ -272,7 +277,6 @@ def test_upload_can_set_queued_status(tmp_path, monkeypatch):
             return None
 
         monkeypatch.setattr("app.api.uploads.get_settings", lambda: settings)
-        monkeypatch.setattr("app.api.uploads.build_schema_proposal_from_file", lambda *args, **kwargs: None)
         monkeypatch.setattr("app.api.uploads.enqueue_submission_dispatch", noop)
         monkeypatch.setattr("app.api.uploads.ws_manager.broadcast", noop)
 
