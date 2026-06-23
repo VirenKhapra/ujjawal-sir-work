@@ -129,7 +129,7 @@ class CalculateIntent(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     kind: Literal["calculate"]
-    operations: list[str] = Field(default_factory=list)
+    operations: list[Any] = Field(default_factory=list)  # Accepts both str and dict operations
 
 
 class VisualizeIntent(BaseModel):
