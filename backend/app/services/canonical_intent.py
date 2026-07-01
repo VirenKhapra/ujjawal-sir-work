@@ -1830,9 +1830,9 @@ def _repair_filter_mode(
 ) -> dict[str, Any]:
     """Fix filter mode when user says 'remove/drop/delete rows' but LLM produced mode='keep'.
 
-    When the instruction explicitly says to remove/drop/delete rows matching a condition,
-    the filter mode should be 'drop' (remove matching rows). If the LLM produced 'keep',
-    flip it.
+    Also removes spurious drop_columns actions when the user clearly says
+    'remove rows' (the LLM sometimes confuses 'remove rows having X' with
+    'drop column X').
     """
     if not isinstance(canonical_intent, dict):
         return canonical_intent
@@ -1840,27 +1840,53 @@ def _repair_filter_mode(
     normalized = _normalize_text(instruction)
 
     # Detect "remove/drop/delete rows/records/entries WHERE condition" language
-    is_removal = bool(re.search(
+    is_row_removal = bool(re.search(
         r"\b(?:remove|drop|delete|exclude|discard|filter\s+out)\s+"
-        r"(?:the\s+)?(?:rows?|records?|entries?|field|data|values?)?\s*"
+        r"(?:the\s+)?(?:rows?|records?|entries?|data|values?)?\s*"
         r"(?:which|that|where|having|with|containing|contains)",
         normalized,
         re.IGNORECASE,
     ))
 
-    if not is_removal:
+    if not is_row_removal:
         return canonical_intent
 
     actions = canonical_intent.get("actions")
     if not isinstance(actions, list):
         return canonical_intent
 
+    # Fix filter mode
     for action in actions:
         if not isinstance(action, dict) or action.get("kind") != "filter_rows":
             continue
-        # Only flip if mode is currently "keep" — user wants removal
         if action.get("mode") == "keep":
+            # Check if operators are already inverted (neq, not_in) — if so,
+            # the LLM already expressed removal semantics, just flip mode without
+            # creating double negation
+            conditions = action.get("conditions", [])
+            has_negated_ops = any(
+                isinstance(c, dict) and c.get("operator") in ("neq", "not_in", "not_contains")
+                for c in conditions
+            )
+            if has_negated_ops:
+                # LLM used negated operators — flip them to positive + set mode=drop
+                for c in conditions:
+                    if isinstance(c, dict):
+                        op = c.get("operator")
+                        if op == "neq":
+                            c["operator"] = "eq"
+                        elif op == "not_in":
+                            c["operator"] = "in"
+                        elif op == "not_contains":
+                            c["operator"] = "contains"
             action["mode"] = "drop"
+
+    # Remove spurious drop_columns when user said "remove rows"
+    # (LLM confused "remove rows having X as education" with "drop education column")
+    canonical_intent["actions"] = [
+        a for a in actions
+        if not (isinstance(a, dict) and a.get("kind") == "drop_columns")
+    ]
 
     return canonical_intent
 
